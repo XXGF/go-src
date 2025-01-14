@@ -12,6 +12,19 @@ func add(p unsafe.Pointer, x uintptr) unsafe.Pointer {
 	return unsafe.Pointer(uintptr(p) + x)
 }
 
+/*
+getg函数的作用：
+	getg 函数的主要作用是返回当前正在执行的 Goroutine 的指针。
+	这个指针指向一个 g 结构体，g 结构体包含了当前 Goroutine 的所有状态信息，包括栈指针、程序计数器、调度器状态等。
+
+getg函数的实现：
+	在实际的 Go 运行时代码中，getg 函数的实现依赖于特定的架构和平台。
+	所以getg函数是汇编实现。
+*/
+
+// 在 Go 运行时中，getg 函数用于获取当前 Goroutine 的指针。
+// 编译器会将对这个函数的调用重写为直接从线程本地存储（TLS）或专用寄存器中获取 Goroutine 指针的指令。
+// 这种优化可以提高性能，因为直接访问寄存器或 TLS 比调用函数要快得多。
 // getg returns the pointer to the current g.
 // The compiler rewrites calls to this function into instructions
 // that fetch the g directly (from TLS or from the dedicated register).

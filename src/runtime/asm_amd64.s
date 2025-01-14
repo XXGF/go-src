@@ -95,8 +95,10 @@ TEXT runtime·rt0_go(SB),NOSPLIT,$0
 
 	// create istack out of the given (operating system) stack.
 	// _cgo_init may update stackguard.
+	// 全局的g0实例地址放到DI
 	MOVQ	$runtime·g0(SB), DI
 	LEAQ	(-64*1024+104)(SP), BX
+	// 初始化全局g0实例的stackguard0\stackguard1\stack这三个字段
 	MOVQ	BX, g_stackguard0(DI)
 	MOVQ	BX, g_stackguard1(DI)
 	MOVQ	BX, (g_stack+stack_lo)(DI)
@@ -180,6 +182,7 @@ needtls:
 	JMP ok
 #endif
 
+    // 取全局m0实例的tls字段地址放在DI，并进行设置
 	LEAQ	runtime·m0+m_tls(SB), DI
 	CALL	runtime·settls(SB)
 
@@ -192,6 +195,7 @@ needtls:
 	CALL	runtime·abort(SB)
 ok:
 	// set the per-goroutine and per-mach "registers"
+	// 验证成功后，把全局g0实例放进tls，并且将g0和m0互相引用
 	get_tls(BX)
 	LEAQ	runtime·g0(SB), CX
 	MOVQ	CX, g(BX)
@@ -209,19 +213,25 @@ ok:
 	MOVL	AX, 0(SP)
 	MOVQ	24(SP), AX		// copy argv
 	MOVQ	AX, 8(SP)
+	// 执行文件的绝对路径初始化
 	CALL	runtime·args(SB)
+	// cpu个数和内存页大小初始化
 	CALL	runtime·osinit(SB)
+	// 命令行参数、环境变量、gc、栈空间、内存管理、所有P实例、HASH算法等初始化
 	CALL	runtime·schedinit(SB)
 
 	// create a new goroutine to start program
+	// runtime.main函数地址放进AX
 	MOVQ	$runtime·mainPC(SB), AX		// entry
 	PUSHQ	AX
 	PUSHQ	$0			// arg size
+	// 新建一个goroutine，该goroutine绑定runtime.main，放在P的本地队列，等待调度
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 	POPQ	AX
 
 	// start this M
+	// 启动M，开始调度goroutine
 	CALL	runtime·mstart(SB)
 
 	CALL	runtime·abort(SB)	// mstart should never return

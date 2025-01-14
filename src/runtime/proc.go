@@ -1139,6 +1139,13 @@ func startTheWorldWithSema(emitTraceEvent bool) int64 {
 	return startTime
 }
 
+/*
+mstart 是 Go 运行时中的一个函数，用于新建 M（Machine）的入口点。
+M 是 Go 运行时中的一个抽象概念，表示一个操作系统线程。
+Go 运行时使用 M 来管理和调度 Goroutine 的执行。
+mstart 函数是用汇编语言编写的，使用 ABI0 调用约定，并且标记为 TOPFRAME，表示它是调用栈的顶层框架。
+mstart 函数最终会调用 mstart0 函数来完成 M 的初始化和启动。
+*/
 // mstart is the entry-point for new Ms.
 //
 // This must not split the stack because we may not even have stack
@@ -1150,42 +1157,72 @@ func startTheWorldWithSema(emitTraceEvent bool) int64 {
 //go:nosplit
 //go:nowritebarrierrec
 func mstart() {
+	// 获取当前执行的 Goroutine 的指针
+	// 这个指针指向一个 g 结构体，g 结构体包含了当前 Goroutine 的所有状态信息，包括栈指针、程序计数器、调度器状态等。
 	_g_ := getg()
 
+	// 判断当前执行的goroutine是否是g0
+	// g0 是唯一一个会在系统栈上执行的 Goroutine。
 	osStack := _g_.stack.lo == 0
 	if osStack {
 		// Initialize stack bounds from system stack.
 		// Cgo may have left stack size in stack.hi.
 		// minit may update the stack bounds.
 		size := _g_.stack.hi
+		// 如果 stack.hi 的值为 0，表示栈的大小尚未初始化。此时，代码会将 size 设置为一个默认值。
 		if size == 0 {
 			size = 8192 * sys.StackGuardMultiplier
 		}
+		// 将 size 作为栈的大小，设置到 g 结构体的 stack.hi 字段中。
+		// noescape：这是一个编译器内建函数，表示这个指针不会在函数返回后逃逸。
+		// 这样可以避免垃圾回收器错误地认为这个指针在函数返回后仍然有效。
 		_g_.stack.hi = uintptr(noescape(unsafe.Pointer(&size)))
+		// 重新计算栈的低地址。减去1024是为了防止栈溢出。
 		_g_.stack.lo = _g_.stack.hi - size + 1024
 	}
+
+	/*
+		栈保护：
+		栈保护是一个用于检测栈溢出的机制。Go 运行时系统使用两个栈保护变量 stackguard0 和 stackguard1 来实现这一机制：
+		1.stackguard0：用于常规的 Go 代码调用。它是一个阈值，当栈指针（stack pointer）接近这个阈值时，Go 运行时系统会触发栈扩展或其他保护措施。
+		2.stackguard1：用于 go:systemstack 标记的函数调用。这些函数通常是运行时系统的一部分，需要在系统栈上执行。
+	*/
+
 	// Initialize stack guard so that we can start calling regular
 	// Go code.
+	// 这行代码将 stackguard0 设置为栈底（stack.lo）加上一个常量 _StackGuard。
+	// 这个常量 _StackGuard 是一个预定义的偏移量，用于确保在栈溢出之前有足够的空间进行检测和处理。
 	_g_.stackguard0 = _g_.stack.lo + _StackGuard
 	// This is the g0, so we can also call go:systemstack
 	// functions, which check stackguard1.
+	// 由于这是 g0 Goroutine，它可以调用 go:systemstack 标记的函数，这些函数会检查 stackguard1。
+	// 因此，将 stackguard1 设置为与 stackguard0 相同的值。
 	_g_.stackguard1 = _g_.stackguard0
 	mstart1()
 
 	// Exit this thread.
+	// 用于在特定操作系统上退出当前线程。
+	// 它首先检查当前操作系统类型，并根据操作系统类型设置 osStack 变量，然后调用 mexit 函数退出线程。
 	switch GOOS {
+	// GOOS 是一个预定义的编译时常量，表示目标操作系统
 	case "windows", "solaris", "illumos", "plan9", "darwin", "aix":
 		// Windows, Solaris, illumos, Darwin, AIX and Plan 9 always system-allocate
 		// the stack, but put it in _g_.stack before mstart,
 		// so the logic above hasn't set osStack yet.
 		osStack = true
 	}
+	// mexit 函数是 Go 运行时系统中的一个关键函数，用于退出当前线程。
 	mexit(osStack)
 }
 
+/*
+	mstart1 是 Go 运行时系统中的一个关键函数，用于初始化和启动一个新的 M（操作系统线程）。这个函数在 mstart 函数中被调用，负责设置线程的初始状态，并进入调度循环。
+
+*/
 func mstart1() {
 	_g_ := getg()
 
+	// g0 是一个特殊的 Goroutine，负责执行调度器和一些运行时的管理任务。
 	if _g_ != _g_.m.g0 {
 		throw("bad runtime·mstart")
 	}
@@ -1194,24 +1231,32 @@ func mstart1() {
 	// for terminating the thread.
 	// We're never coming back to mstart1 after we call schedule,
 	// so other calls can reuse the current frame.
+	// save 函数记录调用者的程序计数器（PC）和栈指针（SP），以便在 mcall 和终止线程时使用。
 	save(getcallerpc(), getcallersp())
+	// 初始化汇编相关内容
 	asminit()
+	// 进行 M 的初始化，包括设置线程本地存储（TLS）和信号掩码。
 	minit()
 
 	// Install signal handlers; after minit so that minit can
 	// prepare the thread to be able to handle the signals.
+	// 如果当前 M 是 m0，则调用 mstartm0 函数安装信号处理程序。
+	// m0 是 Go 运行时系统启动时创建的第一个 M。
+	// 如果当前 M 是主线程（m0），则调用 mstartm0 安装信号处理程序。信号处理程序的安装在 minit 之后进行，以确保线程已准备好处理信号。
 	if _g_.m == &m0 {
 		mstartm0()
 	}
-
+	// 如果 mstartfn 不为 nil，则调用它。mstartfn 是一个可选的函数指针，用于在 M 启动时执行一些自定义初始化代码。
 	if fn := _g_.m.mstartfn; fn != nil {
 		fn()
 	}
-
+	// 如果当前 M 不是 m0，则获取下一个 P（处理器），并将 nextp 设置为 0。【因为m0已经在入口的汇编代码中，绑了一个p】
+	// P 是 Go 运行时系统中的一个抽象概念，表示一个逻辑处理器。
 	if _g_.m != &m0 {
 		acquirep(_g_.m.nextp.ptr())
 		_g_.m.nextp = 0
 	}
+	// 调用 schedule 函数进入调度循环，开始调度和执行 Goroutine。
 	schedule()
 }
 
@@ -1258,19 +1303,37 @@ func mexit(osStack bool) {
 		//
 		// We could try to clean up this M more before wedging
 		// it, but that complicates signal handling.
+		// 释放当前 M 持有的 P。
 		handoffp(releasep())
+		// 锁定调度器
 		lock(&sched.lock)
+		// 增加已释放的 M 的计数。
 		sched.nmfreed++
+		// 调用死锁检测器，检查是否存在死锁情况。
 		checkdead()
+		// 解锁调度器
 		unlock(&sched.lock)
+		// 将主线程置于休眠状态，等待被唤醒。
 		notesleep(&m.park)
+		// 如果主线程被意外唤醒，则抛出异常。这是一种防御性编程措施，确保主线程在不应该被唤醒时不会继续执行。
 		throw("locked m0 woke up")
 	}
 
+	// 阻塞信号处理
+	// 这是为了确保在退出线程的过程中不会被信号中断，从而避免潜在的竞态条件和不一致状态。
 	sigblock()
+	// 取消 M 的初始化
+	// 调用 unminit 函数取消当前 M 的初始化状态。
+	// 这通常包括清理线程本地存储（TLS）等资源。
+	// unminit 函数的具体实现可能因平台而异，但其目的是确保在退出线程之前清理与 M 相关的所有资源。
 	unminit()
 
 	// Free the gsignal stack.
+	// 检查 gsignal 栈：如果当前 M 有一个 gsignal 栈（用于处理信号的栈），则执行以下操作。
+	// 1. 释放 gsignal 栈：调用 stackfree 函数释放 gsignal 栈的内存。
+	// 2. 解除 gsignal 栈的链接：将 m.gsignal 设置为 nil。
+	// 在某些平台上，当调用 VDSO（如 nanotime）时，会将当前的 Goroutine 存储在 gsignal 栈上。
+	// 现在栈已经被释放，因此需要解除它与 M 的链接，以避免在调用 VDSO 代码时写入已释放的栈。
 	if m.gsignal != nil {
 		stackfree(m.gsignal.stack)
 		// On some platforms, when calling into VDSO (e.g. nanotime)
@@ -1281,45 +1344,63 @@ func mexit(osStack bool) {
 	}
 
 	// Remove m from allm.
+	// 这段代码的目的是将当前的 M（线程）从全局 M 列表 allm 中移除。allm 是一个链表，包含了所有已创建的 M。让我们逐步解析这段代码。
+	// 这行代码锁定了调度器的全局锁 sched.lock。这样可以确保在操作 allm 列表时不会有其他线程同时修改它，从而避免竞态条件。
 	lock(&sched.lock)
 	for pprev := &allm; *pprev != nil; pprev = &(*pprev).alllink {
+		// 在遍历过程中，检查当前节点是否是要移除的 M。
+		// 如果是，则将 pprev 指向 m.alllink，即将当前节点从链表中移除。然后跳转到 found 标签。
 		if *pprev == m {
 			*pprev = m.alllink
 			goto found
 		}
 	}
+	// 如果遍历完整个 allm 列表后仍未找到要移除的 M，则抛出异常 "m not found in allm"。
+	// 这是一种防御性编程措施，用于捕捉不应该发生的错误情况。
 	throw("m not found in allm")
 found:
+	// 这个标签表示已经成功找到并移除了 M。后续代码会继续执行。
 	if !osStack {
 		// Delay reaping m until it's done with the stack.
 		//
 		// If this is using an OS stack, the OS will free it
 		// so there's no need for reaping.
+		// 设置 freeWait 标志：使用原子操作将 m.freeWait 设置为 1，表示当前 M 还不能被回收。
 		atomic.Store(&m.freeWait, 1)
 		// Put m on the free list, though it will not be reaped until
 		// freeWait is 0. Note that the free list must not be linked
 		// through alllink because some functions walk allm without
 		// locking, so may be using alllink.
+		// 将 M 放入空闲列表：将当前 M 放入调度器的空闲列表 sched.freem 中。
+		// 注意，这里使用 freelink 而不是 alllink，因为有些函数在遍历 allm 时不加锁。
 		m.freelink = sched.freem
 		sched.freem = m
 	}
+	// 解锁调度器的全局锁 sched.lock，允许其他线程继续操作调度器。
 	unlock(&sched.lock)
 
 	// Release the P.
+	// 释放 P：调用 handoffp(releasep()) 释放当前 M 持有的 P。
+	// 禁止写屏障：在这之后不应再使用写屏障，因为当前 M 可能会被回收。
 	handoffp(releasep())
 	// After this point we must not have write barriers.
 
 	// Invoke the deadlock detector. This must happen after
 	// handoffp because it may have started a new M to take our
 	// P's work.
+	// 锁定调度器：再次锁定调度器的全局锁 sched.lock。
 	lock(&sched.lock)
+	// 更新已释放的 M 计数：增加 sched.nmfreed 计数。
 	sched.nmfreed++
+	// 调用死锁检测器：调用 checkdead() 检查是否存在死锁情况。
 	checkdead()
+	// 解锁调度器：解锁调度器的全局锁 sched.lock。
 	unlock(&sched.lock)
 
 	if osStack {
 		// Return from mstart and let the system thread
 		// library free the g0 stack and terminate the thread.
+		// 如果当前线程使用的是操作系统栈，则直接从 mstart 返回，让系统线程库释放 g0 栈并终止线程。
 		return
 	}
 
@@ -1327,6 +1408,8 @@ found:
 	// return to. Exit the thread directly. exitThread will clear
 	// m.freeWait when it's done with the stack and the m can be
 	// reaped.
+	// 直接退出线程：调用 exitThread(&m.freeWait) 直接退出线程。
+	// exitThread 会在完成栈的处理后清除 m.freeWait，这样 M 就可以被回收。
 	exitThread(&m.freeWait)
 }
 
@@ -2002,13 +2085,25 @@ func startm(_p_ *p, spinning bool) {
 
 // Hands off P from syscall or locked M.
 // Always runs without a P, so write barriers are not allowed.
+// handoffp 函数是 Go 运行时系统中的一个关键函数，用于在某些情况下将 P（Processor）从一个 M（Machine）移交给另一个 M。
+// 这个函数在没有 P 的情况下运行，因此不允许使用写屏障（write barriers）。写屏障是垃圾回收机制的一部分，用于跟踪指针的写操作，以便正确地进行垃圾回收。
+
+// handoffp 函数的主要作用是将一个 P 从一个 M 移交给另一个 M，以确保 P 能够继续执行 Goroutine。
+// 这个函数通常在以下情况下被调用：
+// 1. 当一个 M 进入系统调用并且需要释放其持有的 P。
+// 2. 当一个 M 被锁定到一个 G 并且需要释放其持有的 P。
+
 //go:nowritebarrierrec
 func handoffp(_p_ *p) {
 	// handoffp must start an M in any situation where
 	// findrunnable would return a G to run on _p_.
 
 	// if it has local work, start it straight away
+	// 检查 _p_ 的本地工作队列是否为空。如果不为空，表示 _p_ 有本地的 Goroutine 需要处理。
+	// 检查全局工作队列的大小是否为零。如果不为零，表示全局工作队列中有 Goroutine 需要处理。
 	if !runqempty(_p_) || sched.runqsize != 0 {
+		// 调用 startm 函数启动一个新的 M，并将 _p_ 传递给它。
+		// 第二个参数 false 表示不强制创建一个新的 M，而是尝试复用现有的 M。
 		startm(_p_, false)
 		return
 	}
@@ -2072,30 +2167,49 @@ func wakep() {
 	startm(nil, true)
 }
 
+/*
+这段代码是 Go 运行时系统中的一部分，用于处理一个特定的情况：
+当一个 M（Machine）被锁定到一个 G（Goroutine）时，停止该 M 的执行，直到该 G 再次变为可运行状态。
+
+stoplockedm 函数在 Go 运行时系统中用于处理 M 和 G 之间的锁定关系。
+当一个 M 被锁定到一个 G 时，如果 G 需要等待某些条件满足，stoplockedm 会停止该 M 的执行，直到 G 再次变为可运行状态。
+这个函数确保了锁定状态的一致性，并在必要时将 P 交给其他 M 运行，以保持系统的高效运行。
+*/
 // Stops execution of the current m that is locked to a g until the g is runnable again.
 // Returns with acquired P.
 func stoplockedm() {
 	_g_ := getg()
-
+	// 检查当前 M 是否锁定了一个 G，并且该 G 是否也锁定了当前 M。如果不满足这些条件，则抛出异常，表示锁定状态不一致
 	if _g_.m.lockedg == 0 || _g_.m.lockedg.ptr().lockedm.ptr() != _g_.m {
 		throw("stoplockedm: inconsistent locking")
 	}
+	// 如果当前 M 关联了一个 P（Processor），则释放该 P，并将其交给另一个 M 运行。
 	if _g_.m.p != 0 {
 		// Schedule another M to run this p.
+		// 释放p
 		_p_ := releasep()
+		// 将p交给其他m执行
 		handoffp(_p_)
 	}
+	// 增加空闲锁定的计数。
 	incidlelocked(1)
 	// Wait until another thread schedules lockedg again.
+	// 使当前 M 进入休眠状态，直到另一个线程再次调度锁定的 G。
+	// 【这里会阻塞住，里面是个for循环】
 	notesleep(&_g_.m.park)
+	// 锁定G被唤醒，M可以继续执行，所以清除休眠标记。
 	noteclear(&_g_.m.park)
+	// 读取锁定的 G 的状态。
 	status := readgstatus(_g_.m.lockedg.ptr())
+	// 检查锁定的 G 是否处于可运行状态（_Grunnable）或扫描可运行状态（_Gscanrunnable）。如果不是，则打印错误信息并抛出异常。
 	if status&^_Gscan != _Grunnable {
 		print("runtime:stoplockedm: g is not Grunnable or Gscanrunnable\n")
 		dumpgstatus(_g_)
 		throw("stoplockedm: not runnable")
 	}
+	// acquirep 函数将 nextp 指向的 P 重新与当前 M 关联。这意味着当前 M 将继续使用这个 P 来执行 Goroutine。
 	acquirep(_g_.m.nextp.ptr())
+	// 将 nextp 设置为 0 是为了清除这个临时存储的 P。这样做的目的是确保 nextp 不再指向任何 P，避免在后续操作中产生混淆或错误。
 	_g_.m.nextp = 0
 }
 
@@ -2197,25 +2311,40 @@ func findrunnable() (gp *g, inheritTime bool) {
 	// The conditions here and in handoffp must agree: if
 	// findrunnable would return a G to run, handoffp must start
 	// an M.
+	// findrunnable 函数和 handoffp 函数之间的条件必须一致。
+	// 如果 findrunnable 函数返回一个可运行的 goroutine，handoffp 函数必须启动一个新的 M（线程）。
 
 top:
+	// 获取当前 M 绑定的 P，并将其赋值给 _p_。
 	_p_ := _g_.m.p.ptr()
+	// 检查全局调度器的 gcwaiting 标志是否被设置。如果被设置，表示需要进行垃圾回收。
 	if sched.gcwaiting != 0 {
+		// 调用 gcstopm 函数，停止当前 M 以便进行垃圾回收。
 		gcstopm()
 		goto top
 	}
+	// 检查当前 P 是否有需要运行的安全点函数。
+	// 补充：安全点函数：在某些情况下，Go 运行时系统需要在特定的安全点运行一些函数，以确保系统的一致性和安全性。
 	if _p_.runSafePointFn != 0 {
 		runSafePointFn()
 	}
 
+	// 调用 checkTimers 函数，检查当前 P 的定时器。checkTimers 返回当前时间 now、下一个定时器触发时间 pollUntil
 	now, pollUntil, _ := checkTimers(_p_, 0)
 
+	// 补充：Finalizer 是一个函数，当某个对象即将被垃圾回收时，Go 运行时系统会调用这个函数。finalizer 通常用于释放非 Go 语言的资源，例如关闭文件描述符、释放 C 语言分配的内存等。
+	//      finalizer goroutine 是负责执行这些 finalizer 函数的 goroutine。
+	// 检查 fingwait 和 fingwake 标志是否都被设置。如果都被设置，表示有等待的 finalizer goroutine 需要被唤醒。
 	if fingwait && fingwake {
+		// 调用 wakefing 函数，尝试唤醒一个 finalizer goroutine。如果成功唤醒，gp 不为 nil。
 		if gp := wakefing(); gp != nil {
+			// 用 ready 函数，将唤醒的 goroutine 标记为可运行，并将其放入运行队列。
 			ready(gp, 0, true)
 		}
 	}
+	// 检查 cgo_yield 是否被设置。如果被设置，表示需要进行 cgo 的让步。
 	if *cgo_yield != nil {
+		// 调用 asmcgocall 函数，执行 cgo 的让步操作。
 		asmcgocall(*cgo_yield, nil)
 	}
 
@@ -2236,50 +2365,89 @@ top:
 		}
 	}
 
+	/*
+		网络轮询是 Go 调度器中的一个优化步骤，用于在尝试从其他处理器（P）中窃取 Goroutine 之前，先检查是否有任何网络事件已经准备好处理。
+
+		这个网络轮询只是一个优化步骤，在我们尝试从其他处理器中窃取 Goroutine 之前进行。
+		如果没有任何等待的G，或者netpoll中的线程已经阻塞，我们可以安全地跳过它。
+		如果与那个被阻塞的线程存在任何逻辑上的竞争（例如，它已经从网络轮询返回，但还没有设置 lastpoll），这个线程无论如何都会在下面进行阻塞的网络轮询。
+	*/
 	// Poll network.
 	// This netpoll is only an optimization before we resort to stealing.
 	// We can safely skip it if there are no waiters or a thread is blocked in netpoll already.
 	// If there is any kind of logical race with that blocked thread (e.g. it has already returned from netpoll, but does not set lastpoll yet), this thread will do blocking netpoll below anyway.
-	// 此网络轮询只是在我们采取偷盗措施之前的一种优化。
-	// 如果没有等待的G或netpoll中的线程已阻塞，我们可以安全地跳过它。
+
+	/*
+				设计意图：
+				1. 优化调度：通过在尝试从其他处理器中窃取 Goroutine 之前进行网络轮询，可以更快地找到可运行的 Goroutine，从而优化调度性能。
+			    2. 减少阻塞：非阻塞的网络轮询可以避免线程阻塞，提高系统的响应速度。
+				3. 并发安全：使用原子操作检查条件，确保在多线程环境下的并发安全。
+
+				总结：
+				这段代码通过进行非阻塞的网络轮询，尝试找到已经准备好处理的网络事件对应的 Goroutine。
+		  		如果找到了可运行的 Goroutine，它会将其状态更改为可运行，并返回该 Goroutine。
+				这个步骤是 Go 调度器中的一个优化步骤，用于在尝试从其他处理器中窃取 Goroutine 之前，先检查是否有任何网络事件已经准备好处理。
+		 		通过这种方式，可以更快地找到可运行的 Goroutine，从而优化调度性能并减少线程阻塞。
+	*/
 
 	// 3. 从网络轮询器中获取G
+	// 检查网络轮询是否已初始化。
+	// 检查是否有等待网络事件的 Goroutine。
+	// 检查 lastpoll 是否已设置，确保没有其他线程正在进行网络轮询。
 	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
+		// 调用 netpoll(0) 进行非阻塞的网络轮询，检查是否有任何网络事件已经准备好处理。
+		// 如果返回的列表 list 不为空，表示有网络事件已经准备好。
 		if list := netpoll(0); !list.empty() { // non-blocking
+			// 从列表中弹出一个 Goroutine gp。
 			gp := list.pop()
+			// 将剩余的 Goroutine 列表注入到全局队列或本地队列中
 			injectglist(&list)
+			// 将 gp 的状态从 _Gwaiting 更改为 _Grunnable，表示它现在可以运行。
 			casgstatus(gp, _Gwaiting, _Grunnable)
 			if trace.enabled {
+				// 如果跟踪（trace）功能启用，记录跟踪信息。
 				traceGoUnpark(gp, 0)
 			}
+			// 返回 gp 和 false，表示找到了一个可运行的 Goroutine。
 			return gp, false
 		}
 	}
 
 	// Steal work from other P's.
+	// 当前系统中最大处理器数（GOMAXPROCS）。
 	procs := uint32(gomaxprocs)
+	// 标记是否运行了定时器。
 	ranTimer := false
 	// If number of spinning M's >= number of busy P's, block.
 	// This is necessary to prevent excessive CPU consumption
 	// when GOMAXPROCS>>1 but the program parallelism is low.
+	// 如果当前 M 没有在自旋，并且自旋的 M 数量大于等于忙碌的 P 数量，则阻塞当前 M。
+	// 这样做是为了防止在 GOMAXPROCS 远大于 1 但程序并行度较低时，过度的 CPU 消耗。
 	if !_g_.m.spinning && 2*atomic.Load(&sched.nmspinning) >= procs-atomic.Load(&sched.npidle) {
 		goto stop
 	}
+	// 如果当前 M 没有在自旋，将其设置为自旋状态，并增加自旋的 M 数量。
 	if !_g_.m.spinning {
 		_g_.m.spinning = true
 		atomic.Xadd(&sched.nmspinning, 1)
 	}
+	// 外层循环尝试 4 次从其他 P 中窃取工作。
 	for i := 0; i < 4; i++ {
+		// 内层循环遍历所有 P，尝试从中窃取工作。
 		for enum := stealOrder.start(fastrand()); !enum.done(); enum.next() {
+			// 如果垃圾回收正在等待，跳转到 top 重新开始。
 			if sched.gcwaiting != 0 {
 				goto top
 			}
+			// stealRunNextG：在前两次尝试中，只窃取准备队列中有多个 Goroutine 的 P。
+			// 即前两轮不窃取 runNextG
 			stealRunNextG := i > 2 // first look for ready queues with more than 1 g
+			// 当前尝试窃取工作的 P。
 			p2 := allp[enum.position()]
 			if _p_ == p2 {
 				continue
 			}
-			// 从其他线程绑定的P中窃取G
+			// 尝试从 p2 中窃取 Goroutine，如果成功，返回窃取到的 Goroutine。
 			if gp := runqsteal(_p_, p2, stealRunNextG); gp != nil {
 				return gp, false
 			}
@@ -2294,13 +2462,20 @@ top:
 			// own timers.
 			// If we're still looking for work after checking all
 			// the P's, then go ahead and steal from an active P.
+			// 在第三次或第四次尝试时，
+			// 或者在第二次尝试且 shouldStealTimers(p2) 返回 true 时，尝试窃取定时器任务。
 			if i > 2 || (i > 1 && shouldStealTimers(p2)) {
+				// 调用 checkTimers 检查 p2 的定时器任务。
+				// tnow：当前时间。
+				// w：下一个定时器的等待时间。
+				// ran：是否运行了定时器任务。
 				tnow, w, ran := checkTimers(p2, now)
 				now = tnow
 				if w != 0 && (pollUntil == 0 || w < pollUntil) {
 					pollUntil = w
 				}
 				if ran {
+					// 如果运行了定时器任务，可能有新的 Goroutine 被添加到本地运行队列。
 					// Running the timers may have
 					// made an arbitrary number of G's
 					// ready and added them to this P's
@@ -2309,6 +2484,8 @@ top:
 					// that is always has room to add
 					// stolen G's. So check now if there
 					// is a local G to run.
+					// 尝试从本地运行队列中获取一个 Goroutine。
+					// 如果成功，返回这个 Goroutine 及其继承的时间。
 					if gp, inheritTime := runqget(_p_); gp != nil {
 						return gp, inheritTime
 					}
@@ -2548,6 +2725,12 @@ func resetspinning() {
 	wakep()
 }
 
+/*
+设计意图
+1. 负载均衡：通过将 Goroutine 添加到全局队列或本地队列，实现负载均衡，确保 Goroutine 能够被及时调度执行。
+2. 并发安全：通过获取调度器锁，确保在多线程环境下对全局队列的访问是线程安全的。
+3. 与 GC 并发运行：设计上允许与垃圾回收并发运行，避免在垃圾回收期间阻塞调度器。
+*/
 // injectglist adds each runnable G on the list to some run queue,
 // and clears glist. If there is no current P, they are added to the
 // global queue, and up to npidle M's are started to run them.
@@ -2613,19 +2796,31 @@ func injectglist(glist *gList) {
 	}
 }
 
+/*
+schedule 函数是 Go 运行时系统中的核心调度函数。
+它负责在调度循环中找到一个可运行的 goroutine 并执行它。
+这个函数永远不会返回，因为它会不断地寻找和执行 goroutine。
+*/
 // One round of scheduler: find a runnable goroutine and execute it.
 // Never returns.
 // XGF Go调度器的逻辑
 func schedule() {
-	// 1. 这里获取到的G永远是g0
+	// 1. 这里获取到的G永远是g0。
+	// 因为只有g0才有调度其他g的能力？
+	// 是不是每个m，都有一个g0？
+	// 答案：g0 是一个特殊的 Goroutine，它并不执行用户代码，而是用于执行调度器和运行时的内部任务。
+	// 在 Go 的运行时系统中，每个 M（Machine）都有一个 g0，负责该 M 中的 Goroutine 的调度。
 	_g_ := getg()
 
 	if _g_.m.locks != 0 {
+		// 如果当前 M（线程）持有锁，则抛出异常。调度器不应该在持有锁的情况下进行调度。
 		throw("schedule: holding locks")
 	}
 
 	if _g_.m.lockedg != 0 {
+		// 如果当前 M 锁定了一个 G，则停止当前 M，交出P，然后自旋等待锁定G被其他G调用/唤醒。
 		stoplockedm()
+		// 当锁定G被唤醒，则继续执行锁定G
 		execute(_g_.m.lockedg.ptr(), false) // Never returns.
 	}
 
@@ -2634,8 +2829,9 @@ func schedule() {
 	if _g_.m.incgo {
 		throw("schedule: in cgo")
 	}
-
+	// 调度循环的起点标签。
 top:
+	// 获取当前 M 绑定的 P。
 	pp := _g_.m.p.ptr()
 	pp.preempt = false
 
@@ -2644,6 +2840,7 @@ top:
 		gcstopm()
 		goto top
 	}
+	// 如果 P 有安全点函数需要运行，则运行该函数。
 	if pp.runSafePointFn != 0 {
 		runSafePointFn()
 	}
@@ -2651,10 +2848,14 @@ top:
 	// Sanity check: if we are spinning, the run queue should be empty.
 	// Check this before calling checkTimers, as that might call
 	// goready to put a ready goroutine on the local run queue.
+	// 检查自旋状态：
+	// 如果 M 正在自旋且本地运行队列不为空，则抛出异常。
 	if _g_.m.spinning && (pp.runnext != 0 || pp.runqhead != pp.runqtail) {
 		throw("schedule: spinning with local work")
 	}
 
+	// checkTimers 函数用于检查定时器，并可能将定时器触发的 goroutine 放入本地运行队列。
+	// goready 函数用于将一个 goroutine 标记为可运行，并将其放入本地或全局运行队列。
 	checkTimers(pp, 0)
 
 	// 下一个G
@@ -2664,7 +2865,9 @@ top:
 	// Normal goroutines will check for need to wakeP in ready,
 	// but GCworkers and tracereaders will not, so the check must
 	// be done here instead.
+	// tryWakeP 标志用于指示是否需要唤醒一个新的 P（处理器）来处理更多的 goroutine。
 	tryWakeP := false
+	// 如果跟踪启用或关闭，则尝试获取一个跟踪读取器 goroutine。
 	if trace.enabled || trace.shutdown {
 		gp = traceReader()
 		if gp != nil {
@@ -2673,6 +2876,10 @@ top:
 			tryWakeP = true
 		}
 	}
+	// gcBlackenEnabled 是一个全局变量，用于指示垃圾回收的黑化阶段是否启用。
+	// 黑化阶段是垃圾回收的一部分，在这个阶段，垃圾回收器会标记所有存活的对象。
+	// 尝试找到一个可运行的 GC 工作 goroutine。
+	// 这个方法会在当前 P（处理器）上寻找一个可运行的 GC 工作 goroutine，并将其赋值给 gp。
 	if gp == nil && gcBlackenEnabled != 0 {
 		gp = gcController.findRunnableGCWorker(_g_.m.p.ptr())
 		tryWakeP = tryWakeP || gp != nil
@@ -2681,6 +2888,13 @@ top:
 		// Check the global runnable queue once in a while to ensure fairness.
 		// Otherwise two goroutines can completely occupy the local runqueue
 		// by constantly respawning each other.
+
+		// 当前 P 的调度计数器 schedtick 是否是 61 的倍数。schedtick 是一个计数器，每次调度时递增一次。
+		// 通过取模运算，可以确保每 61 次调度检查一次全局运行队列。
+
+		// 为什么要检查全局运行队列？
+		// 主要目的是为了确保调度的公平性。
+		// 否则，两个 goroutine 可能会通过不断地相互生成新 goroutine 而完全占据本地运行队列，导致其他 goroutine 无法得到调度。
 		if _g_.m.p.ptr().schedtick%61 == 0 && sched.runqsize > 0 {
 			lock(&sched.lock)
 			gp = globrunqget(_g_.m.p.ptr(), 1)
@@ -2688,12 +2902,18 @@ top:
 		}
 	}
 	if gp == nil {
+		// 从本地运行队列中获取一个可运行的 goroutine。
 		gp, inheritTime = runqget(_g_.m.p.ptr())
+		// 即使当前 M（线程）处于自旋状态，gp 也可能不为 nil。
+		// 这是因为 checkTimers 函数可能通过 goready 将一个本地 goroutine 添加到本地运行队列中。
 		// We can see gp != nil here even if the M is spinning,
 		// if checkTimers added a local goroutine via goready.
+
+		// 补充：自旋状态：自旋是指 M 在没有找到可运行的 goroutine 时，不立即进入休眠，而是进行短暂的忙等待，
+		// 以期望在短时间内有新的 goroutine 变为可运行状态。自旋可以减少线程上下文切换的开销，提高性能。
 	}
 	if gp == nil {
-		// 3. 取下一个处于可运行状态的G
+		// 3. 取下一个处于可运行状态的G，按以下规则进行获取
 		// 3.1 从本地队列取
 		// 3.2 从全局队列取
 		// 3.3 从其他线程中窃取
@@ -3043,6 +3263,7 @@ func save(pc, sp uintptr) {
 	_g_.sched.sp = sp
 	_g_.sched.lr = 0
 	_g_.sched.ret = 0
+	// 将当前 G 的指针存储在调度器的 g 字段中。
 	_g_.sched.g = guintptr(unsafe.Pointer(_g_))
 	// We need to ensure ctxt is zero, but can't have a write
 	// barrier here. However, it should always already be zero.
@@ -4570,6 +4791,8 @@ func checkdead() {
 	// For -buildmode=c-shared or -buildmode=c-archive it's OK if
 	// there are no running goroutines. The calling program is
 	// assumed to be running.
+	// 如果当前是以 c-shared 或 c-archive 模式构建的，
+	// 那么即使没有正在运行的 Goroutine 也是可以的，因为调用程序被假定为正在运行。
 	if islibrary || isarchive {
 		return
 	}
@@ -4578,6 +4801,7 @@ func checkdead() {
 	// freezetheworld will cause all running threads to block.
 	// And runtime will essentially enter into deadlock state,
 	// except that there is a thread that will call exit soon.
+	// 如果由于信号导致程序正在崩溃（panicking > 0），则不进行死锁检查，因为程序即将退出。
 	if panicking > 0 {
 		return
 	}
@@ -5121,32 +5345,47 @@ func globrunqputbatch(batch *gQueue, n int32) {
 	*batch = gQueue{}
 }
 
+/*
+	全局队列这么设计的目的：
+	1.负载均衡：通过从全局队列中获取一批 Goroutine 并将它们分配到本地队列，globrunqget 函数帮助实现 Goroutine 的负载均衡。
+    2.高效调度：通过批量获取 Goroutine，减少了对全局队列的访问频率，从而提高了调度的效率。
+	3.并发安全：函数注释中提到 "Sched must be locked"，意味着在调用此函数时，调度器必须被锁定，以确保对全局队列的访问是线程安全的。
+*/
 // Try get a batch of G's from the global runnable queue.
 // Sched must be locked.
 func globrunqget(_p_ *p, max int32) *g {
+	// 如果全局可运行队列的大小为零，直接返回 nil，表示没有可获取的 Goroutine。
 	if sched.runqsize == 0 {
 		return nil
 	}
 
+	// 初始值为 sched.runqsize/gomaxprocs + 1，即全局队列大小除以最大处理器数加一。
 	n := sched.runqsize/gomaxprocs + 1
+	// 如果 n 大于全局队列大小，则将 n 设置为全局队列大小。
 	if n > sched.runqsize {
 		n = sched.runqsize
 	}
+	// 如果 max 大于零且 n 大于 max，则将 n 设置为 max。
 	if max > 0 && n > max {
 		n = max
 	}
+	// 如果 n 大于本地队列长度的一半，则将 n 设置为本地队列长度的一半。
 	if n > int32(len(_p_.runq))/2 {
 		n = int32(len(_p_.runq)) / 2
 	}
 
+	// 从全局队列大小中减去 n，更新全局队列的大小。
 	sched.runqsize -= n
 
+	// 从全局队列中弹出一个 Goroutine，并将其赋值给 gp。
 	gp := sched.runq.pop()
 	n--
 	for ; n > 0; n-- {
+		// 继续从全局队列中弹出 n-1 个 Goroutine，并将它们放入本地队列中。
 		gp1 := sched.runq.pop()
 		runqput(_p_, gp1, false)
 	}
+	// 返回第一个获取的 Goroutine gp。
 	return gp
 }
 
@@ -5319,25 +5558,38 @@ func runqputbatch(pp *p, q *gQueue, qsize int) {
 // If inheritTime is true, gp should inherit the remaining time in the
 // current time slice. Otherwise, it should start a new time slice.
 // Executed only by the owner P.
+// runqget 函数的目的是从本地可运行队列中获取一个 goroutine。
+// 如果 inheritTime 为 true，表示获取的 goroutine 应该继承当前时间片的剩余时间。
+// 否则，应该开始一个新的时间片。
+// 该函数仅由 P 的所有者执行。
 func runqget(_p_ *p) (gp *g, inheritTime bool) {
 	// If there's a runnext, it's the next G to run.
+	// 获取 runnext，这是一个优化路径，用于快速获取下一个要运行的 goroutine。
 	for {
+		// 获取不到待运行的G，直接退出
 		next := _p_.runnext
 		if next == 0 {
 			break
 		}
+		// 获取到待运行的G
+		// 使用原子操作将 runnext 设置为 0，确保只有一个线程可以成功获取 runnext。
+		// 即使能成功将 runnext 置为 0，则表示成功获取到 runnext。
 		if _p_.runnext.cas(next, 0) {
 			return next.ptr(), true
 		}
 	}
 
 	for {
+		// 使用原子加载获取 runqhead，这是一个加载-获取操作，用于与其他消费者同步。
 		h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with other consumers
 		t := _p_.runqtail
+		// 如果队列为空（runqhead 等于 runqtail），返回 nil 和 false。
 		if t == h {
 			return nil, false
 		}
+		// 从队列中获取 goroutine。
 		gp := _p_.runq[h%uint32(len(_p_.runq))].ptr()
+		// 使用原子比较并交换操作更新 runqhead，这是一个比较并交换-释放操作，提交消费。
 		if atomic.CasRel(&_p_.runqhead, h, h+1) { // cas-release, commits consume
 			return gp, false
 		}
@@ -5625,12 +5877,18 @@ func sync_runtime_doSpin() {
 
 var stealOrder randomOrder
 
+// randomOrder 和 randomEnum 类型，它们是用于随机化工作窃取的辅助类型。
+// 通过这些类型，可以在不重复的情况下以不同的伪随机顺序枚举所有的处理器（P）。
+// 这种随机化有助于在多处理器环境中更均匀地分配工作负载，避免某些处理器过载而其他处理器空闲。
+// 该算法基于以下事实：如果我们有一个数 X，使得 X 和 GOMAXPROCS 互质，那么序列 (i + X) % GOMAXPROCS 可以给出所需的枚举顺序。
 // randomOrder/randomEnum are helper types for randomized work stealing.
 // They allow to enumerate all Ps in different pseudo-random orders without repetitions.
 // The algorithm is based on the fact that if we have X such that X and GOMAXPROCS
 // are coprime, then a sequences of (i + X) % GOMAXPROCS gives the required enumeration.
 type randomOrder struct {
-	count    uint32
+	// 处理器的数量（通常是 GOMAXPROCS）。
+	count uint32
+	// 与 count 互质的数的列表。
 	coprimes []uint32
 }
 

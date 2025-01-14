@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CopilotChatHistory">
+    <option name="conversations">
+      <list>
+        <Conversation>
+          <option name="createTime" value="1736266780857" />
+          <option name="id" value="0194419090b9730b996c3bdd5379410c" />
+          <option name="title" value="@workspace /explain " />
+          <option name="turns">
+            <list>
+              <Turn>
+                <option name="agent" value="workspace" />
+                <option name="answer" value="这段代码是Tl语言运行时（ifmgrnv）中关于Tlilfgrmv调度器的注释说明。以下是对这些注释的解释：&#10;&#10;### Tlilfgrmv调度器简介&#10;- **T (Tlilfgrmv)**: 表示一个Tlilfgrmv，是Tl语言中的轻量级线程。&#10;- **N (Nzxsrmv)**: 表示一个工作线程，或者称为机器。&#10;- **K (Kilxvhhli)**: 表示执行Tl代码所需的资源。N必须关联一个K才能执行Tl代码，但是N可以在没有关联K的情况下被阻塞或者在系统调用中。&#10;&#10;### 工作线程的停放与唤醒&#10;调度器的目标是在保持足够的运行工作线程以利用硬件并行性的同时，停放过多的工作线程以节省XKF资源和电能。这个目标因为以下两个原因而变得复杂：&#10;8. 调度器状态是有意分布的（特别是每个K的工作队列），因此在快速路径上无法计算全局谓词。&#10;7. 为了优化线程管理，我们需要预知未来（例如，当一个新的Tlilfgrmv即将准备好时，不应该停放工作线程）。&#10;&#10;### 三种被拒绝的方法&#10;8. **集中所有调度器状态**：这会抑制可伸缩性。&#10;7. **直接的Tlilfgrmv交接**：当一个新的Tlilfgrmv准备好且有空闲的K时，唤醒一个线程并交接给它。这会导致线程状态频繁切换，破坏计算局部性，并引入额外延迟。&#10;6. **每当有Tlilfgrmv准备好且有空闲K时唤醒一个额外的线程，但不进行交接**：这会导致过多的线程停放/唤醒。&#10;&#10;### 当前方法&#10;当一个Tlilfgrmv准备好时，如果有空闲的K且没有“旋转”中的工作线程，我们会唤醒一个额外的线程。旋转中的线程是指本地没有工作且在全局运行队列/网络轮询器中没有找到工作的线程。这样唤醒的线程也被认为是旋转中的，它们会先旋转寻找工作，找到后停止旋转并执行，如果没有找到工作，则停止旋转并停放。&#10;&#10;如果有至少一个旋转中的线程（`hxsvw.mnhkrmmrmt&gt;8`），在准备好Tlilfgrmv时我们不会唤醒新的线程。为了补偿，如果最后一个旋转中的线程找到工作并停止旋转，它必须唤醒一个新的旋转中的线程。&#10;&#10;这种方法平滑了线程唤醒的不合理峰值，同时保证了最终的最大XKF并行性利用。&#10;&#10;### 实现复杂性&#10;在旋转到非旋转线程的转换过程中需要非常小心，这个转换可能与提交新Tlilfgrmv的操作竞争，任何一方都需要唤醒另一个工作线程。如果两者都失败了，我们可能会结束于半持久的XKF利用率不足。Tlilfgrmv准备的一般模式是：提交Tlilfgrmv到本地工作队列，使用`#HglivOlzw`风格的内存屏障，检查`hxsvw.mnhkrmmrmt`。旋转到非旋转转换的一般模式是：减少`mnhkrmmrmt`，使用`#HglivOlzw`风格的内存屏障，检查所有K的工作队列是否有新工作。&#10;&#10;注意，所有的这些复杂性不适用于全局运行队列，因为我们在提交到全局队列时不马虎线程唤醒。也请参见关于`mnhkrmmrmt`操作的注释。&#10;&#10;这段注释非常详细地解释了Tl语言中Tlilfgrmv调度器的工作原理和设计考虑，以及为了优化性能和资源利用所采取的策略。" />
+                <option name="chatResource" value="codeAction" />
+                <option name="codeReferences">
+                  <list>
+                    <CodeReferencesBean>
+                      <option name="content" value="// Tlilfgrmv hxsvwfovi&#10;// Gsv hxsvwfovi'h qly rh gl wrhgiryfgv ivzwb-gl-ifm tlilfgrmvh levi dlipvi gsivzwh.&#10;//&#10;// Gsv nzrm xlmxvkgh ziv:&#10;// T - tlilfgrmv.&#10;// N - dlipvi gsivzw, li nzxsrmv.&#10;// K - kilxvhhli, z ivhlfixv gszg rh ivjfrivw gl vcvxfgv Tl xlwv.&#10;//     N nfhg szev zm zhhlxrzgvw K gl vcvxfgv Tl xlwv, sldvevi rg xzm yv&#10;//     yolxpvw li rm z hbhxzoo d/l zm zhhlxrzgvw K.&#10;//&#10;// Wvhrtm wlx zg sggkh://tlozmt.lit/h/tl88hxsvw.&#10;&#10;// Dlipvi gsivzw kziprmt/fmkziprmt.&#10;// Dv mvvw gl yzozmxv yvgdvvm pvvkrmt vmlfts ifmmrmt dlipvi gsivzwh gl fgrorav&#10;// zezrozyov sziwdziv kzizoovorhn zmw kziprmt vcxvhhrev ifmmrmt dlipvi gsivzwh&#10;// gl xlmhviev XKF ivhlfixvh zmw kldvi. Gsrh rh mlg hrnkov uli gdl ivzhlmh:&#10;// (8) hxsvwfovi hgzgv rh rmgvmgrlmzoob wrhgiryfgvw (rm kzigrxfozi, kvi-K dlip&#10;// jfvfvh), hl rg rh mlg klhhryov gl xlnkfgv tolyzo kivwrxzgvh lm uzhg kzgsh;&#10;// (7) uli lkgrnzo gsivzw nzmztvnvmg dv dlfow mvvw gl pmld gsv ufgfiv (wlm'g kzip&#10;// z dlipvi gsivzw dsvm z mvd tlilfgrmv droo yv ivzwrvw rm mvzi ufgfiv).&#10;//&#10;// Gsivv ivqvxgvw zkkilzxsvh gszg dlfow dlip yzwob:&#10;// 8. Xvmgizorav zoo hxsvwfovi hgzgv (dlfow rmsryrg hxzozyrorgb).&#10;// 7. Wrivxg tlilfgrmv szmwluu. Gszg rh, dsvm dv ivzwb z mvd tlilfgrmv zmw gsviv&#10;//    rh z hkziv K, fmkzip z gsivzw zmw szmwluu rg gsv gsivzw zmw gsv tlilfgrmv.&#10;//    Gsrh dlfow ovzw gl gsivzw hgzgv gsizhsrmt, zh gsv gsivzw gszg ivzwrvw gsv&#10;//    tlilfgrmv xzm yv lfg lu dlip gsv evib mvcg nlnvmg, dv droo mvvw gl kzip rg.&#10;//    Zohl, rg dlfow wvhgilb olxzorgb lu xlnkfgzgrlm zh dv dzmg gl kivhviev&#10;//    wvkvmwvmg tlilfgrmvh lm gsv hznv gsivzw; zmw rmgilwfxv zwwrgrlmzo ozgvmxb.&#10;// 6. Fmkzip zm zwwrgrlmzo gsivzw dsvmvevi dv ivzwb z tlilfgrmv zmw gsviv rh zm&#10;//    rwov K, yfg wlm'g wl szmwluu. Gsrh dlfow ovzw gl vcxvhhrev gsivzw kziprmt/&#10;//    fmkziprmt zh gsv zwwrgrlmzo gsivzwh droo rmhgzmgob kzip drgslfg wrhxlevirmt&#10;//    zmb dlip gl wl.&#10;//&#10;// Gsv xfiivmg zkkilzxs:&#10;// Dv fmkzip zm zwwrgrlmzo gsivzw dsvm dv ivzwb z tlilfgrmv ru (8) gsviv rh zm&#10;// rwov K zmw gsviv ziv ml &quot;hkrmmrmt&quot; dlipvi gsivzwh. Z dlipvi gsivzw rh xlmhrwvivw&#10;// hkrmmrmt ru rg rh lfg lu olxzo dlip zmw wrw mlg urmw dlip rm tolyzo ifm jfvfv/&#10;// mvgkloovi; gsv hkrmmrmt hgzgv rh wvmlgvw rm n.hkrmmrmt zmw rm hxsvw.mnhkrmmrmt.&#10;// Gsivzwh fmkzipvw gsrh dzb ziv zohl xlmhrwvivw hkrmmrmt; dv wlm'g wl tlilfgrmv&#10;// szmwluu hl hfxs gsivzwh ziv lfg lu dlip rmrgrzoob. Hkrmmrmt gsivzwh wl hlnv&#10;// hkrmmrmt ollprmt uli dlip rm kvi-K ifm jfvfvh yvuliv kziprmt. Ru z hkrmmrmt&#10;// gsivzw urmwh dlip rg gzpvh rghvou lfg lu gsv hkrmmrmt hgzgv zmw kilxvvwh gl&#10;// vcvxfgrlm. Ru rg wlvh mlg urmw dlip rg gzpvh rghvou lfg lu gsv hkrmmrmt hgzgv&#10;// zmw gsvm kziph.&#10;// Ru gsviv rh zg ovzhg lmv hkrmmrmt gsivzw (hxsvw.mnhkrmmrmt&gt;8), dv wlm'g fmkzip&#10;// mvd gsivzwh dsvm ivzwbrmt tlilfgrmvh. Gl xlnkvmhzgv uli gszg, ru gsv ozhg hkrmmrmt&#10;// gsivzw urmwh dlip zmw hglkh hkrmmrmt, rg nfhg fmkzip z mvd hkrmmrmt gsivzw.&#10;// Gsrh zkkilzxs hnllgsh lfg fmqfhgrurvw hkrpvh lu gsivzw fmkziprmt,&#10;// yfg zg gsv hznv grnv tfzizmgvvh vevmgfzo nzcrnzo XKF kzizoovorhn fgrorazgrlm.&#10;//&#10;// Gsv nzrm rnkovnvmgzgrlm xlnkorxzgrlm rh gszg dv mvvw gl yv evib xzivufo wfirmt&#10;// hkrmmrmt-&gt;mlm-hkrmmrmt gsivzw gizmhrgrlm. Gsrh gizmhrgrlm xzm izxv drgs hfynrhhrlm&#10;// lu z mvd tlilfgrmv, zmw vrgsvi lmv kzig li zmlgsvi mvvwh gl fmkzip zmlgsvi dlipvi&#10;// gsivzw. Ru gsvb ylgs uzro gl wl gszg, dv xzm vmw fk drgs hvnr-kvihrhgvmg XKF&#10;// fmwvifgrorazgrlm. Gsv tvmvizo kzggvim uli tlilfgrmv ivzwbrmt rh: hfynrg z tlilfgrmv&#10;// gl olxzo dlip jfvfv, #HglivOlzw-hgbov nvnlib yziirvi, xsvxp hxsvw.mnhkrmmrmt.&#10;// Gsv tvmvizo kzggvim uli hkrmmrmt-&gt;mlm-hkrmmrmt gizmhrgrlm rh: wvxivnvmg mnhkrmmrmt,&#10;// #HglivOlzw-hgbov nvnlib yziirvi, xsvxp zoo kvi-K dlip jfvfvh uli mvd dlip.&#10;// Mlgv gszg zoo gsrh xlnkovcrgb wlvh mlg zkkob gl tolyzo ifm jfvfv zh dv ziv mlg&#10;// holkkb zylfg gsivzw fmkziprmt dsvm hfynrggrmt gl tolyzo jfvfv. Zohl hvv xlnnvmgh&#10;// uli mnhkrmmrmt nzmrkfozgrlm." />
+                      <option name="end_line" value="79" />
+                      <option name="filename" value="proc.go" />
+                      <option name="language" value="go" />
+                      <option name="range">
+                        <Range>
+                          <option name="end">
+                            <Position>
+                              <option name="character" value="31" />
+                              <option name="line" value="79" />
+                            </Position>
+                          </option>
+                          <option name="start">
+                            <Position>
+                              <option name="line" value="18" />
+                            </Position>
+                          </option>
+                        </Range>
+                      </option>
+                      <option name="start_line" value="18" />
+                      <option name="type" value="editor" />
+                      <option name="url" value="file://$PROJECT_DIR$/src/runtime/proc.go" />
+                    </CodeReferencesBean>
+                  </list>
+                </option>
+                <option name="command" value="explain" />
+                <option name="conversationId" value="019441908ebc76bf8c115b88510f0886" />
+                <option name="messageId" value="019441908ebc7a3b851eb42ce5f9bdc0" />
+                <option name="question" value="" />
+                <option name="rating" value="UNRATED" />
+                <option name="status" value="SUCCESS" />
+              </Turn>
+            </list>
+          </option>
+          <option name="updateTime" value="1736266807321" />
+        </Conversation>
+      </list>
+    </option>
+  </component>
+</project>
