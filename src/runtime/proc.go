@@ -28,6 +28,39 @@ var modinfo string
 //
 // Design doc at https://golang.org/s/go11sched.
 
+/*
+Go 运行时系统中关于工作线程（worker thread）停放（parking）和唤醒（unparking）的策略。
+其核心目标是在充分利用硬件并行性的同时，避免过多的线程运行以节省 CPU 资源和功耗。以下是对这段注释的详细解释：
+
+背景
+	在 Go 的调度器中，工作线程（M）与处理器（P）和 Goroutine（G）协同工作。
+	调度器需要在保持足够的运行线程以利用硬件并行性和停放多余的线程以节省资源之间取得平衡。
+
+挑战
+	1. 分布式调度器状态：调度器状态是分布式的，特别是每个 P 的工作队列。这使得在快速路径上计算全局状态变得困难。
+	2. 未来的不确定性：为了实现最佳的线程管理，我们需要知道未来的情况（例如，不要在即将有新的 Goroutine 准备就绪时停放线程）。
+
+被拒绝的三种方法
+	1. 集中化调度器状态：这会抑制系统的可扩展性。
+	2. 直接 Goroutine 交接：当一个新的 Goroutine 准备就绪且有空闲的 P 时，唤醒一个线程并交接 Goroutine。这会导致线程状态的频繁切换，并破坏计算的局部性。【一个G新启另一个G，他们之间的数据往往是有关联的，应该将它们放在同一个M中执行，以利用好计算的局部性】
+	3. 每次准备 Goroutine 时唤醒额外线程：这会导致过多的线程停放和唤醒，因为额外的线程可能会立即停放而没有发现任何工作。
+
+当前的方法
+	1. 当一个新的 Goroutine 准备就绪时，如果有空闲的 P 且没有“自旋”的工作线程，则唤醒一个额外的线程。
+	2. 自旋线程是指那些没有本地工作且在全局运行队列或网络轮询器中没有找到工作的线程。
+	3. 自旋线程在停放（parking）前会在每个 P 的运行队列中寻找工作。
+	4. 如果自旋线程找到工作，它会退出自旋状态并继续执行；如果没有找到工作，它会退出自旋状态然后停放。
+	5. 如果至少有一个自旋线程（sched.nmspinning > 1），在准备 Goroutine 时不会唤醒新线程。
+	6. 如果最后一个自旋线程找到工作并停止自旋，它必须唤醒一个新的自旋线程。
+
+实现复杂性
+	1. 在自旋到非自旋线程的转换过程中需要非常小心。这种转换可能与新 Goroutine 的提交竞争。
+	2. Goroutine 准备的通用模式是：将 Goroutine 提交到本地工作队列，进行内存屏障操作，然后检查 sched.nmspinning。
+	3. 自旋到非自旋转换的通用模式是：减少 nmspinning，进行内存屏障操作，然后检查所有 P 的工作队列以寻找新工作。
+总结
+	这种方法通过平滑 不必要的线程唤醒峰值，同时保证最终的最大 CPU 并行性利用率。通过小心处理自旋到非自旋的转换，避免了 CPU 资源的半持久性未充分利用。
+*/
+
 // Worker thread parking/unparking.
 // We need to balance between keeping enough running worker threads to utilize
 // available hardware parallelism and parking excessive running worker threads
@@ -1894,8 +1927,11 @@ var newmHandoff struct {
 // May run with m.p==nil, so write barriers are not allowed.
 //go:nowritebarrierrec
 func newm(fn func(), _p_ *p) {
+	// 调用 allocm 函数分配一个新的 M，并将其与 P 和 fn 关联。
 	mp := allocm(_p_, fn)
+	// 设置 M 的 nextp 为传入的 P。
 	mp.nextp.set(_p_)
+	// 初始化 M 的信号掩码 sigmask 为 initSigmask。
 	mp.sigmask = initSigmask
 	if gp := getg(); gp != nil && gp.m != nil && (gp.m.lockedExt != 0 || gp.m.incgo) && GOOS != "plan9" {
 		// We're on a locked M or a thread that may have been
@@ -1922,6 +1958,7 @@ func newm(fn func(), _p_ *p) {
 		unlock(&newmHandoff.lock)
 		return
 	}
+	// 如果当前 Goroutine 不在锁定的 M 上运行，或者不是由 C 启动的线程，则直接调用 newm1 函数启动新的 M。
 	newm1(mp)
 }
 
@@ -2035,6 +2072,9 @@ func mspinning() {
 	getg().m.spinning = true
 }
 
+/*
+	用于调度一个 M（线程）来运行一个 P（处理器），如果必要的话会创建一个新的 M。
+*/
 // Schedules some M to run the p (creates an M if necessary).
 // If p==nil, tries to get an idle P, if no idle P's does nothing.
 // May run with m.p==nil, so write barriers are not allowed.
@@ -2046,10 +2086,13 @@ func startm(_p_ *p, spinning bool) {
 	if _p_ == nil {
 		_p_ = pidleget()
 		if _p_ == nil {
+			// 如果没有空闲的 P，解锁并检查 spinning 标志。
 			unlock(&sched.lock)
 			if spinning {
 				// The caller incremented nmspinning, but there are no idle Ps,
 				// so it's okay to just undo the increment and give up.
+				// 如果 spinning 被设置，调用者已经增加了 nmspinning，因此需要减少 nmspinning 并放弃操作。
+				// 如果减少 nmspinning 后的值小于 0，抛出异常 throw("startm: negative nmspinning")。
 				if int32(atomic.Xadd(&sched.nmspinning, -1)) < 0 {
 					throw("startm: negative nmspinning")
 				}
@@ -2057,8 +2100,11 @@ func startm(_p_ *p, spinning bool) {
 			return
 		}
 	}
+	// 尝试获取一个 M（mget）。
 	mp := mget()
+	// 解锁 sched.lock。
 	unlock(&sched.lock)
+	// 如果没有可用的 M，创建一个新的 M（newm），并根据 spinning 标志设置 m.spinning。
 	if mp == nil {
 		var fn func()
 		if spinning {
@@ -2080,6 +2126,7 @@ func startm(_p_ *p, spinning bool) {
 	// The caller incremented nmspinning, so set m.spinning in the new M.
 	mp.spinning = spinning
 	mp.nextp.set(_p_)
+	// 唤醒 M（notewakeup(&mp.park)）。
 	notewakeup(&mp.park)
 }
 
@@ -2154,13 +2201,18 @@ func handoffp(_p_ *p) {
 	unlock(&sched.lock)
 }
 
+// 用于在一个新的 Goroutine 变为可运行状态时尝试增加一个处理器（P）来执行 Goroutine
 // Tries to add one more P to execute G's.
 // Called when a G is made runnable (newproc, ready).
 func wakep() {
+	// 使用原子操作 atomic.Load 检查全局空闲处理器计数 sched.npidle。
+	// 如果没有空闲的 P（sched.npidle 为 0），则直接返回，不做任何操作。
 	if atomic.Load(&sched.npidle) == 0 {
 		return
 	}
 	// be conservative about spinning threads
+	// 如果当前有自旋线程（sched.nmspinning 不为 0），则直接返回，不做任何操作。
+	// 如果没有自旋线程，尝试将 sched.nmspinning 从 0 设置为 1，表示将启动一个新的自旋线程。启动失败也返回。
 	if atomic.Load(&sched.nmspinning) != 0 || !atomic.Cas(&sched.nmspinning, 0, 1) {
 		return
 	}
@@ -2213,24 +2265,37 @@ func stoplockedm() {
 	_g_.m.nextp = 0
 }
 
+/*
+	startlockedm 函数的目的是调度一个锁定的 M 来运行一个锁定的 G。
+	该函数可能在 STW（Stop The World）期间运行，因此不允许写屏障（go:nowritebarrierrec）。
+*/
 // Schedules the locked m to run the locked gp.
 // May run during STW, so write barriers are not allowed.
 //go:nowritebarrierrec
 func startlockedm(gp *g) {
+	// 获取当前的 Goroutine _g_。
 	_g_ := getg()
-
+	// 获取锁定的 M，gp.lockedm 是指向锁定 M 的指针。
 	mp := gp.lockedm.ptr()
+	// 如果锁定的 M 是当前 M，抛出异常 throw("startlockedm: locked to me")。
 	if mp == _g_.m {
 		throw("startlockedm: locked to me")
 	}
+	// 如果锁定的 M 已经有 P，抛出异常 throw("startlockedm: m has p")。
 	if mp.nextp != 0 {
 		throw("startlockedm: m has p")
 	}
+	// 直接将当前 P 交给锁定的 M
 	// directly handoff current P to the locked m
+	// 调用 incidlelocked(-1) 函数减少空闲锁定 M 的计数。
 	incidlelocked(-1)
+	// 调用 releasep() 函数释放当前 M 持有的 P，并将其返回给 _p_。
 	_p_ := releasep()
+	// 将 P 设置为锁定的 M 的 nextp。
 	mp.nextp.set(_p_)
+	// 调用 notewakeup(&mp.park) 函数唤醒锁定的 M。
 	notewakeup(&mp.park)
+	// 调用 stopm() 函数停止当前 M。
 	stopm()
 }
 
@@ -2261,6 +2326,15 @@ func gcstopm() {
 	stopm()
 }
 
+/*
+	这段代码是 Go 运行时调度器的一部分，用于将一个 goroutine（gp）调度到当前线程（M）上运行。
+	它处理了 goroutine 的状态转换、时间片继承、性能分析器的设置以及跟踪事件的记录。
+*/
+// 将 gp 调度到当前线程（M）上运行。
+// 如果 inheritTime 为真，gp 继承当前时间片的剩余时间。否则，它将开始一个新的时间片。
+// 该函数不会返回。
+// 允许写屏障，因为这是在获取 P 之后立即调用的。
+// go:yeswritebarrierrec：编译器指令，允许在此函数中使用写屏障。
 // Schedules gp to run on the current M.
 // If inheritTime is true, gp inherits the remaining time in the
 // current time slice. Otherwise, it starts a new time slice.
@@ -2271,26 +2345,37 @@ func gcstopm() {
 //
 //go:yeswritebarrierrec
 func execute(gp *g, inheritTime bool) {
+	// 获取当前 goroutine
 	_g_ := getg()
 
 	// Assign gp.m before entering _Grunning so running Gs have an
 	// M.
+	// 将当前M和要执行的G相互绑定：
+	// 1. 将当前线程（M）的 curg 设置为 gp。
 	_g_.m.curg = gp
+	// 2. 将 gp 的 m 设置为当前线程（M）。
 	gp.m = _g_.m
+	// 将 gp 的状态从 _Grunnable（可运行）设置为 _Grunning（运行中）。
 	casgstatus(gp, _Grunnable, _Grunning)
+	// 重置 gp 的等待时间。
 	gp.waitsince = 0
+	// 重置 gp 的抢占标志为：不允许抢占
 	gp.preempt = false
+	// 设置 gp 的栈保护区。
 	gp.stackguard0 = gp.stack.lo + _StackGuard
+	// 如果不继承时间片，增加当前处理器（P）的调度计数。
 	if !inheritTime {
 		_g_.m.p.ptr().schedtick++
 	}
 
+	// 设置性能分析器：
 	// Check whether the profiler needs to be turned on or off.
 	hz := sched.profilehz
 	if _g_.m.profilehz != hz {
 		setThreadCPUProfiler(hz)
 	}
 
+	// 处理跟踪事件：
 	if trace.enabled {
 		// GoSysExit has to happen when we have a P, but before GoStart.
 		// So we emit it here.
@@ -2299,7 +2384,7 @@ func execute(gp *g, inheritTime bool) {
 		}
 		traceGoStart()
 	}
-
+	// 在 Go 语言中，gogo 是一个低级别的运行时函数，通常用汇编语言实现。它的主要作用是切换到指定的 goroutine 并开始执行该 goroutine 的代码。
 	gogo(&gp.sched)
 }
 
@@ -2709,19 +2794,23 @@ func wakeNetPoller(when int64) {
 	}
 }
 
+// 用于重置一个线程（M）的自旋状态，并根据需要唤醒另一个处理器（P）。
 func resetspinning() {
 	_g_ := getg()
 	if !_g_.m.spinning {
 		throw("resetspinning: not a spinning m")
 	}
 	_g_.m.spinning = false
+	// 使用原子操作 atomic.Xadd 将全局自旋线程计数 sched.nmspinning 减 1。
 	nmspinning := atomic.Xadd(&sched.nmspinning, -1)
+	// 检查更新后的 nmspinning 是否为负数，如果是，抛出异常
 	if int32(nmspinning) < 0 {
 		throw("findrunnable: negative nmspinning")
 	}
 	// M wakeup policy is deliberately somewhat conservative, so check if we
 	// need to wakeup another P here. See "Worker thread parking/unparking"
 	// comment at the top of the file for details.
+	// 调用 wakep 函数，根据需要唤醒另一个处理器（P）。
 	wakep()
 }
 
@@ -2920,38 +3009,81 @@ top:
 		gp, inheritTime = findrunnable() // blocks until work is available
 	}
 
+	// NOTE: Spinning（空转）：空转状态表示一个线程正在积极地寻找可运行的 goroutine，而不是阻塞等待。
+	//		空转线程用于提高调度器的响应速度，但过多的空转线程会浪费 CPU 资源。
 	// This thread is going to run a goroutine and is not spinning anymore,
 	// so if it was marked as spinning we need to reset it now and potentially
 	// start a new spinning M.
+	// 这个线程即将运行一个 goroutine，因此它不再处于空转状态。
+	// 如果该线程之前被标记为空转状态，我们需要重置这个状态，并可能启动一个新的空转线程。
 	if _g_.m.spinning {
+		// 调用 resetspinning 函数，重置当前线程的空转状态，并可能启动一个新的空转线程。
 		resetspinning()
 	}
 
+	// 检查全局调度器状态 sched.disable.user 是否禁用了用户调度，并且当前 goroutine gp 是否不允许被调度（!schedEnabled(gp)）。
 	if sched.disable.user && !schedEnabled(gp) {
 		// Scheduling of this goroutine is disabled. Put it on
 		// the list of pending runnable goroutines for when we
 		// re-enable user scheduling and look again.
+		// 调度这个 goroutine 被禁用了。将其放入待运行的 goroutine 列表中，以便在重新启用用户调度时再次检查。
+
+		// 获取调度器的全局锁 sched.lock，以确保对调度器状态的修改是线程安全的。
 		lock(&sched.lock)
+		// 在获取锁之后，再次检查当前 goroutine 是否允许被调度
 		if schedEnabled(gp) {
 			// Something re-enabled scheduling while we
 			// were acquiring the lock.
+			// 在获取锁的过程中，调度状态可能已经被其他线程修改。
+			// 如果调度状态已经被重新启用，释放锁并退出。
 			unlock(&sched.lock)
 		} else {
+			// 将当前 goroutine gp 放入 sched.disable.runnable 列表的末尾。
 			sched.disable.runnable.pushBack(gp)
+			// 增加待运行 goroutine 的计数。
 			sched.disable.n++
+			// 释放调度器的全局锁。
 			unlock(&sched.lock)
+			// 跳转到代码的顶部，重新开始调度循环。
 			goto top
 		}
 	}
 
+	/*
+		Note:
+		用于处理即将调度的 goroutine 是否需要唤醒一个新的处理器（P），以及处理被锁定到特定线程（M）的 goroutine。
+		GCworker 和 tracereader：这些是 Go 运行时系统中的特殊 goroutine，用于垃圾回收和跟踪。它们可能需要额外的处理器资源来确保系统的高效运行。
+	*/
 	// If about to schedule a not-normal goroutine (a GCworker or tracereader),
 	// wake a P if there is one.
+	// 检查是否需要唤醒一个新的处理器（P）。tryWakeP 是一个布尔值，表示是否需要唤醒一个新的 P。
 	if tryWakeP {
+		// 调用 wakep 函数，唤醒一个新的处理器（P）。这通常在即将调度一个非正常的 goroutine（如 GCworker 或 tracereader）时发生，以确保有足够的处理器来处理这些特殊的任务。
 		wakep()
 	}
+
+	/*
+		在 Go 运行时系统中，将一个 Goroutine（G）锁定到一个线程（M）通常是为了确保某些操作在特定的线程上下文中执行。这种情况在以下几种场景中可能会发生：
+		1. 与操作系统线程相关的操作：
+			某些操作需要在特定的操作系统线程上执行。例如，某些系统调用或库函数可能要求在调用线程上执行后续操作。
+			在这种情况下，Go 运行时系统会将 Goroutine 锁定到特定的 M，以确保这些操作在同一个线程上执行。
+		2. 线程本地存储（TLS）：
+		    某些库或系统调用依赖于线程本地存储（TLS）。为了确保 Goroutine 在同一个线程上执行并访问正确的 TLS 数据，Go 运行时系统会将 Goroutine 锁定到特定的 M。
+		3. 外部 C 代码的调用
+			通过 cgo 调用外部 C 代码时，可能需要将 Goroutine 锁定到特定的 M，以确保 C 代码在同一个线程上执行。这是因为某些 C 库可能依赖于线程上下文。
+		4. 处理信号
+			在处理操作系统信号时，可能需要将 Goroutine 锁定到特定的 M，以确保信号处理程序在同一个线程上执行。
+		5. 其他需要线程亲和性的情况
+			某些情况下，可能需要线程亲和性（Thread Affinity），即确保某些操作在特定的线程上执行，以提高性能或满足特定的需求。在这种情况下，Go 运行时系统会将 Goroutine 锁定到特定的 M。
+	*/
+
+	// 检查当前 goroutine 是否被锁定到特定的线程（M）。gp.lockedm 是一个指向锁定线程的指针，如果不为 0，表示该 goroutine 被锁定到特定的 M。
 	if gp.lockedm != 0 {
 		// Hands off own p to the locked m,
 		// then blocks waiting for a new p.
+		// 当前处理器（P）将交给被锁定的线程（M），然后当前线程将阻塞等待一个新的处理器（P）。
+
+		// 调用 startlockedm 函数，将当前处理器（P）交给被锁定的线程（M），并启动该线程来运行当前 goroutine。
 		startlockedm(gp)
 		goto top
 	}

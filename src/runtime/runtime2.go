@@ -180,6 +180,16 @@ type mutex struct {
 	key uintptr
 }
 
+/*
+	note 用于一次性事件的睡眠和唤醒。
+1. 在调用 notesleep 或 notewakeup 之前，必须调用 noteclear 来初始化 note。
+2. 然后，恰好有一个线程可以调用 notesleep，另一个线程可以调用 notewakeup（一次）。
+3. 一旦 notewakeup 被调用，notesleep 将返回。将来的 notesleep 调用将立即返回。
+4. 后续的 noteclear 必须在之前的 notesleep 返回之后调用，例如，不允许在 notewakeup 之后立即调用 noteclear。
+5. notetsleep 类似于 notesleep，但即使事件尚未发生，也会在给定的纳秒数后唤醒。
+6. 如果一个 Goroutine 使用 notetsleep 提前唤醒，它必须等待调用 noteclear，直到确保没有其他 Goroutine 正在调用 notewakeup。
+7. notesleep/notetsleep 通常在 g0 上调用，notetsleepg 类似于 notetsleep，但在用户 Goroutine 上调用。
+*/
 // sleep and wakeup on one-time events.
 // before any calls to notesleep or notewakeup,
 // must call noteclear to initialize the Note.
@@ -200,6 +210,12 @@ type mutex struct {
 //
 // notesleep/notetsleep are generally called on g0,
 // notetsleepg is similar to notetsleep but is called on user g.
+/*
+	note 结构体包含一个 uintptr 类型的字段 key。
+	1. 在基于 Futex 的实现中，key 被视为 uint32 类型的键。
+	2. 在基于信号量的实现中，key 被视为指向等待的 M（线程）的指针。
+	3. 以前这个字段是一个联合体（union），但联合体会破坏精确的垃圾回收（GC）。
+*/
 type note struct {
 	// Futex-based impl treats it as uint32 key,
 	// while sema-based impl as M* waitm.

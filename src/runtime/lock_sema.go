@@ -139,25 +139,32 @@ func noteclear(n *note) {
 	}
 }
 
+// notewakeup 函数的目的是唤醒等待在 note 上的 M（线程）。
 func notewakeup(n *note) {
 	var v uintptr
 	for {
 		v = atomic.Loaduintptr(&n.key)
+		// 使用原子比较并交换操作 atomic.Casuintptr 尝试将 n.key 从 v 设置为 locked。
 		if atomic.Casuintptr(&n.key, v, locked) {
 			break
 		}
 	}
 
+	// 成功将 waitm 设置为 locked 后，检查 note 之前的状态 v。
 	// Successfully set waitm to locked.
 	// What was it before?
 	switch {
 	case v == 0:
+		// 如果 v 为 0，表示没有线程在等待，操作完成。
 		// Nothing was waiting. Done.
 	case v == locked:
+		// 如果 v 为 locked，表示发生了两次 notewakeup，这是不允许的，抛出异常 throw("notewakeup - double wakeup")。
 		// Two notewakeups! Not allowed.
 		throw("notewakeup - double wakeup")
 	default:
 		// Must be the waiting m. Wake it up.
+		// 否则，v 必须是等待的 M，将其转换为 *m 类型并调用 semawakeup 函数唤醒它。
+		// semawakeup 函数用于唤醒等待的 M。具体实现依赖于操作系统的信号量机制.
 		semawakeup((*m)(unsafe.Pointer(v)))
 	}
 }

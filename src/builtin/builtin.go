@@ -78,6 +78,13 @@ type int int
 // distinct type, however, and not an alias for, say, uint32.
 type uint uint
 
+/*
+1. uintptr 只是一个整数类型,它足够大，可以容纳任何指针的位模式。
+2. uintptr 的大小与平台相关。在 32 位平台上，uintptr 是 32 位整数；在 64 位平台上，uintptr 是 64 位整数。
+3. uintptr 类型通常用于需要将指针转换为整数进行一些底层操作的场景。例如：访问变量的私有字段。
+4. uintptr 只是一个整数类型，不具有指针的类型安全性。在将 uintptr 转换回指针时，必须确保它指向有效的内存地址。
+【注意：有时候垃圾回收器会移动一些变量以降低内存碎片等问题，这可能会让uintptr原来对应的内存地址变更，导致uintptr作为地址失效】
+*/
 // uintptr is an integer type that is large enough to hold the bit pattern of
 // any pointer.
 type uintptr uintptr

@@ -167,6 +167,18 @@ func noescape(p unsafe.Pointer) unsafe.Pointer {
 }
 
 func cgocallback(fn, frame unsafe.Pointer, framesize, ctxt uintptr)
+
+/*
+	在 Go 语言中，gogo 是一个低级别的运行时函数，通常用汇编语言实现。
+	它的主要作用是切换到指定的 goroutine 并开始执行该 goroutine 的代码。
+	gogo 函数会保存当前 goroutine 的上下文（如寄存器状态、程序计数器等），并恢复目标 goroutine 的上下文，从而实现从一个 goroutine 切换到另一个 goroutine。
+
+	gogo 函数的作用
+		1. 保存当前上下文：保存当前正在运行的 goroutine 的寄存器状态、程序计数器等上下文信息，以便以后可以恢复。
+		2. 恢复目标上下文：恢复目标 goroutine 的寄存器状态、程序计数器等上下文信息，使其能够继续执行。
+		3. 切换执行：通过切换上下文，CPU 开始执行目标 goroutine 的代码。
+
+*/
 func gogo(buf *gobuf)
 func gosave(buf *gobuf)
 
