@@ -125,6 +125,16 @@ var runtime_inittask initTask
 //go:linkname main_inittask main..inittask
 var main_inittask initTask
 
+/*
+	main_init_done 是一个布尔类型的通道，用于在初始化过程中传递信号。
+	这个通道用于通知 cgocallbackg（一个与 cgo 回调相关的函数）初始化过程已经完成。
+
+	注释解释了 main_init_done 的作用和使用时机：
+		main_init_done 是一个信号，用于通知 cgocallbackg 初始化已经完成。
+		这个通道在 _cgo_notify_runtime_init_done 之前创建，因此所有 cgo 调用都可以依赖它的存在。
+		当 main_init 完成时，这个通道会被关闭，这意味着 cgocallbackg 可以可靠地从这个通道接收信号。
+
+*/
 // main_init_done is a signal used by cgocallbackg that initialization
 // has been completed. It is made before _cgo_notify_runtime_init_done,
 // so all cgo calls can rely on it existing. When main_init is complete,
@@ -143,14 +153,32 @@ var runtimeInitTime int64
 // Value to use for signal mask for newly created M's.
 var initSigmask sigset
 
+/*
+	在 Go 程序启动时，runtime.main 函数会被调用来初始化运行时环境。
+	这个函数会创建和启动第一个 goroutine（即用户定义的 main.main 函数）。在这个过程中，runtime.main 会执行一些初始化操作
+*/
 // The main goroutine.
 func main() {
+	// getg 是一个内联汇编函数，用于获取当前正在运行的 goroutine 的指针。在 Go 运行时系统中，每个 goroutine 都有一个 g 结构体表示。
 	g := getg()
 
+	/*
+		获取当前 goroutine 所属的 M（操作系统线程）。
+		获取 M 的第一个 goroutine（通常是 g0，负责调度和管理其他 goroutine）。
+		m.g0.racectx 是一个用于数据竞争检测的上下文（race context）。
+	*/
 	// Racectx of m0->g0 is used only as the parent of the main goroutine.
 	// It must not be used for anything else.
 	g.m.g0.racectx = 0
 
+	/*
+		用于设置 goroutine 的最大栈大小。不同架构（64 位和 32 位）有不同的最大栈大小限制。
+	*/
+	// 在 64 位系统上，最大栈大小是 1 GB。
+	// 在 32 位系统上，最大栈大小是 250 MB。
+	// sys.PtrSize 是一个常量，表示指针的大小（以字节为单位）。
+	// 在 64 位系统上，指针大小是 8 字节；在 32 位系统上，指针大小是 4 字节。
+	// 通过检查 sys.PtrSize，可以确定当前运行的系统是 64 位还是 32 位。
 	// Max stack size is 1 GB on 64-bit, 250 MB on 32-bit.
 	// Using decimal instead of binary GB and MB because
 	// they look nicer in the stack overflow failure message.
@@ -161,15 +189,55 @@ func main() {
 	}
 
 	// Allow newproc to start new Ms.
+	// 这个变量的设置允许 newproc 函数启动新的 M（操作系统线程）。
 	mainStarted = true
 
+	/*
+		这行代码检查当前的目标架构是否为 WebAssembly（wasm）。
+		如果当前的目标架构是 wasm，则不启动系统监控线程。因为在 wasm 上还没有线程的支持，所以不需要系统监控线程。
+	*/
+	// 在 wasm 目标架构上不启动系统监控线程。因为在 wasm 上还没有线程的支持，所以不需要系统监控线程。
 	if GOARCH != "wasm" { // no threads on wasm yet, so no sysmon
+		// systemstack 是一个 Go 运行时函数，用于在系统栈上执行指定的函数。系统栈是 Go 运行时用于执行一些关键操作的栈，与 goroutine 的用户栈不同。
+		// 这里使用 systemstack 确保 newm 函数在系统栈上执行。
 		systemstack(func() {
 			// GC的关键组件2：启动系统监控
+			// 创建一个新的 M，并在该 M 上运行 sysmon 函数。sysmon 是系统监控函数，负责监控和管理 Go 运行时系统的各种资源和状态。
+			// sysmon 是 Go 运行时中的一个关键函数，负责系统监控。它会定期检查和管理 Go 运行时系统的状态，包括垃圾回收（GC）、调度器状态、网络轮询等。
 			newm(sysmon, nil)
 		})
 	}
 
+	/*
+			lockOSThread 是 Go 运行时中的一个函数，用于将当前的 goroutine 锁定到当前的操作系统线程上。
+			一旦调用 lockOSThread，该 goroutine 将始终在同一个操作系统线程上运行，直到调用 runtime.UnlockOSThread。
+
+			使用场景:
+			1. GUI 应用程序：在某些 GUI 库中，所有的 UI 操作必须在主线程上执行。通过锁定主 goroutine 到主线程，可以确保这些操作在正确的线程上下文中进行。
+			2. 特定的系统调用：某些系统调用可能要求在特定的线程上执行，尤其是在与外部库交互时。
+			3. 线程局部存储（TLS）：如果某些库使用线程局部存储来保存状态，锁定 goroutine 到特定线程可以确保状态的一致性
+
+			场景补充：
+			1. 与操作系统线程相关的操作
+		   某些操作需要在特定的操作系统线程上执行。例如，某些系统调用或库函数可能要求在调用线程上执行后续操作。在这种情况下，Go 运行时系统会将 Goroutine 锁定到特定的 M，以确保这些操作在同一个线程上执行。
+
+			2. 线程本地存储（TLS）
+		   某些库或系统调用依赖于线程本地存储（TLS）。为了确保 Goroutine 在同一个线程上执行并访问正确的 TLS 数据，Go 运行时系统会将 Goroutine 锁定到特定的 M。
+
+			3. 外部 C 代码的调用
+		   通过 cgo 调用外部 C 代码时，可能需要将 Goroutine 锁定到特定的 M，以确保 C 代码在同一个线程上执行。这是因为某些 C 库可能依赖于线程上下文。
+
+			4. 处理信号
+		   在处理操作系统信号时，可能需要将 Goroutine 锁定到特定的 M，以确保信号处理程序在同一个线程上执行。
+
+			5. 其他需要线程亲和性的情况
+		   某些情况下，可能需要线程亲和性（Thread Affinity），即确保某些操作在特定的线程上执行，以提高性能或满足特定的需求。在这种情况下，Go 运行时系统会将 Goroutine 锁定到特定的 M。
+
+	*/
+	// 锁定主 goroutine：注释说明了在初始化期间，将主 goroutine 锁定到主操作系统线程上。
+	// 大多数程序不需要：大多数 Go 程序不需要关心这一点，因为它们不依赖于特定的线程上下文。
+	// 特定调用的要求：某些程序可能需要在主线程上执行特定的调用，例如与 GUI 库交互时，通常要求在主线程上进行操作。
+	// 通过 runtime.LockOSThread：程序可以通过在初始化期间调用 runtime.LockOSThread 来确保 main.main 在主线程上运行，从而保持这种锁定。
 	// Lock the main goroutine onto this, the main OS thread,
 	// during initialization. Most programs won't care, but a few
 	// do require certain calls to be made by the main thread.
@@ -182,7 +250,13 @@ func main() {
 		throw("runtime.main not on m0")
 	}
 
-	// 执行 runtime.init
+	/*
+		在 Go 语言中，包的初始化顺序是非常重要的。
+		每个包可以包含一个或多个 init 函数，这些函数在包被首次导入时自动执行。
+		doInit 函数负责调用这些 init 函数，并确保它们按照正确的顺序执行。
+	*/
+	// doInit 函数负责执行 runtime_inittask 中定义的初始化任务。这些任务包括调用包的 init 函数和初始化包级别的变量。
+	// 通过调用 doInit 函数，运行时系统可以确保所有包级别的变量和 init 函数都已正确初始化。
 	doInit(&runtime_inittask) // must be before defer
 	if nanotime() == 0 {
 		throw("nanotime returning zero")
@@ -196,17 +270,25 @@ func main() {
 		}
 	}()
 
+	// 这行代码的作用是记录程序启动的时间点。
 	// Record when the world started.
 	runtimeInitTime = nanotime()
 
 	// GC的关键组件3：启动垃圾回收器后台
 	gcenable()
 
+	/*
+		这段代码片段涉及到 Go 运行时系统的初始化过程，特别是与 cgo 相关的初始化。cgo 是 Go 语言中的一个特性，允许 Go 代码调用 C 代码。
+	*/
+	// main_init_done = make(chan bool) 创建了一个布尔类型的通道，用于通知主初始化过程的完成。
 	main_init_done = make(chan bool)
+	// iscgo 是一个布尔变量，指示当前程序是否使用了 cgo。如果 iscgo 为 true，则表示程序中包含了 cgo 代码。
 	if iscgo {
+		// _cgo_thread_start：用于启动 cgo 线程。
 		if _cgo_thread_start == nil {
 			throw("_cgo_thread_start missing")
 		}
+		// _cgo_setenv 和 _cgo_unsetenv：用于设置和取消设置环境变量（在非 Windows 系统中）。
 		if GOOS != "windows" {
 			if _cgo_setenv == nil {
 				throw("_cgo_setenv missing")
@@ -215,52 +297,106 @@ func main() {
 				throw("_cgo_unsetenv missing")
 			}
 		}
+		// _cgo_notify_runtime_init_done：用于通知运行时初始化完成。
 		if _cgo_notify_runtime_init_done == nil {
 			throw("_cgo_notify_runtime_init_done missing")
 		}
 		// Start the template thread in case we enter Go from
 		// a C-created thread and need to create a new thread.
+		// startTemplateThread() 函数用于启动一个模板线程，以防在从 C 创建的线程进入 Go 时需要创建一个新线程。
 		startTemplateThread()
+		// cgocall(_cgo_notify_runtime_init_done, nil) 调用 _cgo_notify_runtime_init_done 函数，通知运行时系统初始化已完成。
 		cgocall(_cgo_notify_runtime_init_done, nil)
 	}
 
+	/*
+		在 Go 语言中，初始化过程是一个重要的步骤，确保所有包和全局变量在程序开始执行之前都已正确初始化。
+		Go 运行时系统使用初始化任务来管理这个过程。每个包都有一个初始化任务，表示该包的初始化过程。
+		doInit 函数负责执行这些初始化任务，并确保所有依赖的任务都已完成。例如，如果包 A 依赖于包 B，那么在初始化包 A 之前，必须先初始化包 B。
+	*/
 	// 用户代码 main.init 和 main.main 入口
 	doInit(&main_inittask)
 
+	// cgocallbackg 函数中会监听 main_init_done 这个channel。这里返回之后，cgocallbackg 函数就能从监听channel的阻塞中返回。
 	close(main_init_done)
 
 	needUnlock = false
 	unlockOSThread()
 
+	// 这行代码检查两个布尔变量 isarchive 和 islibrary 是否为 true。
+	// isarchive 和 islibrary 通常用于指示当前编译模式是否为 c-archive 或 c-shared。
+	// 如果当前编译模式是 c-archive 或 c-shared，则直接返回，不执行后续的代码。
 	if isarchive || islibrary {
 		// A program compiled with -buildmode=c-archive or c-shared
 		// has a main, but it is not executed.
 		return
 	}
+	// 这行代码将 main_main 函数赋值给变量 fn。通过这种方式，可以间接调用 main_main 函数。
+	// 这样做的原因：链接器在布置运行时系统时不知道 main 包的地址，因此需要通过间接调用的方式来调用 main_main 函数。
 	fn := main_main // make an indirect call, as the linker doesn't know the address of the main package when laying down the runtime
+	// 这行代码通过变量 fn 调用 main_main 函数。 main_main 函数通常是用户定义的 main 函数的入口点。
 	fn()
+	// raceenabled 是一个布尔变量，用于指示是否启用了数据竞争检测（race detection）。
 	if raceenabled {
+		// 如果启用了数据竞争检测，则调用 racefini() 函数进行相关的清理工作。
 		racefini()
 	}
 
+	/*
+		在主 goroutine 返回时，如果其他 goroutine 正在 panic，则让这些 goroutine 完成 panic trace 的打印工作。
+		一旦完成，它们将退出。这个处理是为了修复一些特定的问题（issues 3934 和 20018）。
+	*/
 	// Make racy client program work: if panicking on
 	// another goroutine at the same time as main returns,
 	// let the other goroutine finish printing the panic trace.
 	// Once it does, it will exit. See issues 3934 and 20018.
+	// runningPanicDefers 是一个原子变量，用于跟踪是否有 goroutine 正在运行 deferred 函数。
+	// 如果有 goroutine 正在运行 deferred 函数，则进入循环等待这些函数完成。
 	if atomic.Load(&runningPanicDefers) != 0 {
 		// Running deferred functions should not take long.
+		// 循环最多等待 1000 次，每次检查 runningPanicDefers 是否变为 0。
 		for c := 0; c < 1000; c++ {
 			if atomic.Load(&runningPanicDefers) == 0 {
 				break
 			}
+			// 使用 Gosched() 让出当前 goroutine 的时间片，以便其他 goroutine 有机会运行。
+			/*
+				为什么要调用 Gosched()，让出当前goroutine的执行权？
+
+				答：
+				这段代码的目的是解决在某些情况下，当主 goroutine 返回时，其他 goroutine 可能正在处理 panic 并打印 panic trace 的问题。
+				为了确保这些 goroutine 能够完成 panic trace 的打印，代码会检查是否有 goroutine 正在处理 panic defer 函数。
+
+				调用 Gosched() 的目的是为了确保其他正在处理 panic defer 函数的 goroutine 有机会运行并完成它们的工作。
+				避免忙等待：
+					如果不调用 Gosched()，当前 goroutine 会在循环中不断检查 runningPanicDefers 的值，这会导致忙等待，占用 CPU 资源。
+					通过调用 Gosched()，当前 goroutine 让出处理器时间片，避免了忙等待，提高了 CPU 的利用效率。
+			*/
 			Gosched()
 		}
 	}
+	// panicking 是一个原子变量，用于跟踪是否有 goroutine 正在 panic。
+	// 如果有 goroutine 正在 panic，则调用 gopark 进入等待状态，直到 panic 处理完成。
 	if atomic.Load(&panicking) != 0 {
 		gopark(nil, nil, waitReasonPanicWait, traceEvGoStop, 1)
 	}
-
+	// 调用 exit(0) 退出程序，返回状态码 0。
 	exit(0)
+
+	// 死循环部分是为了确保程序在退出前不会继续执行其他代码。
+	// 这段代码实际上不会被执行到，因为 exit(0) 会终止程序。
+	// 如果exit(0) 没有成功退出程序，这里就通过不断往空指针写入数据，触发空指针panic来强制退出程序？
+	/*
+		目的和作用
+		1. 防止编译器警告：
+			在某些情况下，编译器可能会对没有返回值或没有明确终止的函数发出警告。通过添加一个死循环，可以确保编译器不会发出这些警告，因为从编译器的角度来看，函数有一个明确的终止路径。
+		2. 防止意外执行：
+			虽然 exit(0) 通常会终止程序，但在极少数情况下，可能会有一些意外情况导致程序继续执行。添加一个死循环可以确保即使 exit(0) 失败，程序也不会继续执行其他代码，从而避免潜在的未定义行为或错误。
+		3. 代码完整性：
+			在某些代码库中，特别是涉及到低级别系统编程或运行时系统的代码，确保代码的完整性和健壮性是非常重要的。通过添加一个死循环，可以确保在任何情况下，程序都不会继续执行到不应该执行的代码。
+		4. 调试和诊断：
+			在调试和诊断过程中，死循环可以作为一个明确的标记，表明程序在这个点应该已经终止。如果程序在这个点继续执行，可以帮助开发者快速定位问题。
+	*/
 	for {
 		var x *int32
 		*x = 0
@@ -309,10 +445,17 @@ func forcegchelper() {
 
 //go:nosplit
 
+/*
+	Gosched 是 Go 语言运行时中的一个函数，用于让出当前 goroutine 的处理器时间片，从而允许其他 goroutine 运行。
+	它不会挂起当前 goroutine，因此当前 goroutine 会在稍后自动恢复执行。
+*/
 // Gosched yields the processor, allowing other goroutines to run. It does not
 // suspend the current goroutine, so execution resumes automatically.
 func Gosched() {
+	// checkTimeouts 是一个内部函数，用于检查是否有超时的操作需要处理。
 	checkTimeouts()
+	// mcall 是一个低级别的运行时函数，用于调用特定的调度器函数。在这里，它调用了 gosched_m 函数。
+	// gosched_m 是一个内部函数，负责实际的调度操作。它会将当前 goroutine 放回到调度队列中，并选择另一个 goroutine 运行。
 	mcall(gosched_m)
 }
 
@@ -3221,21 +3364,47 @@ func park_m(gp *g) {
 	schedule()
 }
 
+/*
+	goschedImpl 是 Go 运行时系统中的一个内部函数，用于实现 Gosched 的具体调度逻辑。
+	这个函数的作用是将当前 goroutine 的状态从运行中（_Grunning）切换到可运行（_Grunnable），
+	然后将其放回全局运行队列，并调用调度器选择下一个 goroutine 运行。
+*/
 func goschedImpl(gp *g) {
+	// 读取当前 goroutine 的状态。gp 是指向当前 goroutine 的指针。
+	// readgstatus 是一个内部函数，用于获取 goroutine 的状态。
 	status := readgstatus(gp)
+	// if status&^_Gscan != _Grunning 检查当前 goroutine 的状态是否为运行中（_Grunning）。
+	// _Gscan 是一个标志位，用于标记 goroutine 是否正在被扫描（例如垃圾回收期间）。
 	if status&^_Gscan != _Grunning {
 		dumpgstatus(gp)
 		throw("bad g status")
 	}
+	// casgstatus(gp, _Grunning, _Grunnable) 将当前 goroutine 的状态从运行中（_Grunning）切换到可运行（_Grunnable）。
+	// casgstatus 是一个内部函数，用于原子地比较并交换 goroutine 的状态。
 	casgstatus(gp, _Grunning, _Grunnable)
+	// dropg() 将当前 goroutine 从当前处理器（P）中移除。
+	// dropg 是一个内部函数，用于处理 goroutine 和处理器之间的关系。
 	dropg()
+	// lock(&sched.lock) 获取全局调度器的锁。
 	lock(&sched.lock)
+	// globrunqput(gp) 将当前 goroutine 放回全局运行队列。
 	globrunqput(gp)
+	// unlock(&sched.lock) 释放全局调度器的锁。
 	unlock(&sched.lock)
 
+	// schedule() 调用调度器，选择下一个 goroutine 运行。
+	// schedule 是一个内部函数，用于实现调度逻辑。
 	schedule()
 }
 
+/*
+	虽然 gosched_m 的具体实现是内部的运行时细节，但其主要作用是将当前 goroutine 放回到调度队列中，并选择另一个 goroutine 运行。
+	这是 Go 运行时调度器的核心功能之一，确保多个 goroutine 能够公平地共享处理器资源。
+
+	gosched_m 在 g0 栈上执行 Gosched 操作。g0 栈是 Go 运行时的调度栈，用于执行调度相关的操作。
+	这个函数的主要目的是让出当前 goroutine 的执行权，使得调度器可以选择运行其他 goroutine。
+*/
+// 到这里当前G已经让出执行权给 g0，加下来的逻辑是在g0中继续。
 // Gosched continuation on g0.
 func gosched_m(gp *g) {
 	if trace.enabled {

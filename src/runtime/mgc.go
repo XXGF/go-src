@@ -216,19 +216,26 @@ func readgogc() int32 {
 	return 100
 }
 
+/*
+	gcenable 函数在 Go 语言的运行时初始化的大部分工作完成后调用，目的是在用户代码开始运行之前启动垃圾回收（GC）相关的后台任务。
+	具体来说，它启动了后台清扫（sweeping）和后台回收（scavenging）两个 goroutine，并在它们完成初始化后启用垃圾回收。
+*/
 // gcenable is called after the bulk of the runtime initialization,
 // just before we're about to start letting user code run.
 // It kicks off the background sweeper goroutine, the background
 // scavenger goroutine, and enables GC.
 func gcenable() {
 	// Kick off sweeping and scavenging.
-	// 启动 bgsweep 和 bgscavenge
+	// 创建一个带缓冲的通道 c，缓冲大小为 2。这个通道用于同步 bgsweep 和 bgscavenge goroutine 的初始化。
 	c := make(chan int, 2)
+	// 启动 bgsweep 和 bgscavenge
 	go bgsweep(c)
 	go bgscavenge(c)
 	<-c
 	<-c
-	// 现在运行时已经初始化完毕了，GC 已就绪
+	// 通过从通道 c 接收两个信号，确保 bgsweep 和 bgscavenge goroutine 都已经完成了初始化。
+
+	// 设置 memstats.enablegc 为 true，表示垃圾回收现在可以正常工作了。
 	memstats.enablegc = true // now that runtime is initialized, GC is okay
 }
 
@@ -289,11 +296,11 @@ var gcBlackenEnabled uint32
 // 在标记工作完成的时候，切换到Marktermination阶段，并在完成标记后切换到Off阶段，停用写屏障
 const (
 	// GC 没有运行，sweep在后台运行，写屏障没有开启
-	_GCoff             = iota // GC not running; sweeping in background, write barrier disabled
+	_GCoff = iota // GC not running; sweeping in background, write barrier disabled
 	// GC 标记roots和workbufs：分配黑色，写屏障启用
-	_GCmark                   // GC marking roots and workbufs: allocate black, write barrier ENABLED
+	_GCmark // GC marking roots and workbufs: allocate black, write barrier ENABLED
 	// GC 标记终止：分配黑色，P`s帮助GC，写屏障启用
-	_GCmarktermination        // GC mark termination: allocate black, P's help GC, write barrier ENABLED
+	_GCmarktermination // GC mark termination: allocate black, P's help GC, write barrier ENABLED
 )
 
 // 当需要进行 GC 阶段切换时，主要就是控制 gcphase 和 writeBarrier 这两个变量
@@ -1982,6 +1989,7 @@ func gcBgMarkPrepare() {
 	work.nproc = ^uint32(0)
 	work.nwait = ^uint32(0)
 }
+
 // runtime.gcBgMarkWorker 是后台的标记任务执行的函数，该函数的循环中执行了对内存中对象图的扫描和标记，
 // 我们分三个部分介绍该函数的实现原理：
 // 1.获取当前处理器以及 Goroutine 打包成 parkInfo 类型的结构体并主动陷入休眠等待唤醒；

@@ -1117,6 +1117,12 @@ func throw(s string) {
 	*(*int)(nil) = 0 // not reached
 }
 
+/*
+	runningPanicDefers 是一个用于跟踪在处理 panic 时运行的延迟函数（deferred functions）的计数器。
+	它的值在处理 panic 的过程中被原子性地递增和递减。
+	这个变量的主要目的是确保在程序因 panic 退出时，尽可能地输出 panic 的堆栈跟踪信息。
+
+*/
 // runningPanicDefers is non-zero while running deferred functions for panic.
 // runningPanicDefers is incremented and decremented atomically.
 // This is used to try hard to get a panic stack trace out when exiting.

@@ -30,6 +30,27 @@ getg函数的实现：
 // that fetch the g directly (from TLS or from the dedicated register).
 func getg() *g
 
+/*
+	mcall 是 Go 语言运行时中的一个内部函数，用于在 goroutine 和 g0 栈之间切换，并调用指定的函数 fn。
+
+	栈切换：
+	1. mcall 函数从当前 goroutine 的栈切换到 g0 栈，并调用传入的函数 fn。
+	2. g0 栈是 Go 运行时的调度栈，用于执行调度相关的操作。
+
+	保存上下文：
+	1. mcall 会保存当前 goroutine 的程序计数器（PC）和栈指针（SP）到 g->sched 中，以便稍后恢复。
+	2. 这允许 mcall 在稍后重新调度时返回到原始的 goroutine。
+
+	函数 fn 的职责：
+	1. 传入的函数 fn 负责安排稍后的执行，通常是通过将 goroutine g 记录在某个数据结构中，并导致某个操作稍后调用 ready(g)。
+	2. fn 不应该返回，通常会通过调用 schedule 来结束，以便让当前的 M（操作系统线程）运行其他 goroutine。
+
+	调用限制：
+	mcall 只能从 goroutine 的栈中调用，不能从 g0 栈或 gsignal 栈中调用。
+
+	逃逸分析：
+	这个函数不能标记为 go:noescape，因为如果 fn 是一个栈分配的闭包，并且 fn 将 g 放入运行队列，而 g 在 fn 返回之前执行，那么闭包在执行时将被无效化。
+*/
 // mcall switches from the g to the g0 stack and invokes fn(g),
 // where g is the goroutine that made the call.
 // mcall saves g's current PC/SP in g->sched so that it can be restored later.
