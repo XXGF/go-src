@@ -156,10 +156,14 @@ var initSigmask sigset
 /*
 	在 Go 程序启动时，runtime.main 函数会被调用来初始化运行时环境。
 	这个函数会创建和启动第一个 goroutine（即用户定义的 main.main 函数）。在这个过程中，runtime.main 会执行一些初始化操作
+
+	runtime.main 函数通常在 Go 程序的启动过程中被调用。
+	具体来说，它是在 Go 程序的入口点（如 _rt0_arm64_darwin 或 _rt0_amd64_linux 等）中被调用的。
 */
 // The main goroutine.
 func main() {
-	// getg 是一个内联汇编函数，用于获取当前正在运行的 goroutine 的指针。在 Go 运行时系统中，每个 goroutine 都有一个 g 结构体表示。
+	// getg 是一个内联汇编函数，用于获取当前正在运行的 goroutine 的指针。
+	// 在 Go 运行时系统中，每个 goroutine 都有一个 g 结构体表示。
 	g := getg()
 
 	/*
@@ -1433,6 +1437,11 @@ func mstart1() {
 		_g_.m.nextp = 0
 	}
 	// 调用 schedule 函数进入调度循环，开始调度和执行 Goroutine。
+	/*
+		这里调用schedule的本质是，开始获取G并执行G。
+		但当前的M是m0，m0绑定的p中，有 runtime.main 对应的G，
+		这个G是在Go程序启动时执行的汇编文件【例如：asm_amd64s】中，放进去的，所以最终会执行runtime.main
+	*/
 	schedule()
 }
 
@@ -4078,9 +4087,14 @@ func malg(stacksize int32) *g {
 // untyped arguments in newproc's argument frame. Stack copies won't
 // be able to adjust them and stack splits won't be able to copy them.
 //
-// 编译器会将所有的go关键字转换成 这个 函数
-// 该函数会接收大小和表示函数的指针 funcval。
-// 在这个函数中我们还会获取 Goroutine 以及调用方的程序计数器，然后调用 runtime.newproc1 函数：
+/*
+	这段 Go 代码定义了一个名为 newproc 的函数，用于创建一个新的 goroutine 并将其放入等待运行的 goroutine 队列中。
+	编译器会将 go 语句转换为对这个函数的调用。
+
+	1. 创建一个新的 goroutine 运行 fn
+	2. 并将其放入等待运行的 goroutine 队列中。
+	3. 编译器会将 go 语句转换为对 newproc 函数的调用。
+*/
 //go:nosplit
 func newproc(siz int32, fn *funcval) {
 	argp := add(unsafe.Pointer(&fn), sys.PtrSize)
@@ -4090,17 +4104,30 @@ func newproc(siz int32, fn *funcval) {
 	pc := getcallerpc()
 	// 将传进来的函数运行在系统栈
 	systemstack(func() {
+		// 在系统栈上，调用 newproc1 函数创建一个新的 goroutine，并将其存储在 newg 变量中。
+		// newproc1 函数负责分配和初始化新的 goroutine。
 		newg := newproc1(fn, argp, siz, gp, pc)
 
+		// 获取当前的 P（处理器）的指针，并将其存储在 _p_ 变量中。
 		_p_ := getg().m.p.ptr()
+		// 将新的 goroutine 放入 P 的运行队列中，等待调度执行。
+		// runqput 函数负责将 goroutine 放入运行队列。
 		runqput(_p_, newg, true)
 
+		// 如果主 goroutine 已经启动，则调用 wakep 函数唤醒一个处理器，以便尽快调度新的 goroutine。
+		// mainStarted 是一个全局变量，指示主 goroutine 是否已经启动。
 		if mainStarted {
 			wakep()
 		}
 	})
 }
 
+/*
+	创建一个新的 goroutine，初始状态为 _Grunnable，从 fn 函数开始执行，参数从 argp 开始，参数大小为 narg 字节。
+	callerpc 是创建这个 goroutine 的 go 语句的地址。
+	调用者负责将新的 goroutine 添加到调度器中。
+	这个函数必须在系统栈上运行，因为它是 newproc 函数的延续，而 newproc 函数不能拆分栈。
+*/
 // Create a new g in state _Grunnable, starting at fn, with narg bytes
 // of arguments starting at argp. callerpc is the address of the go
 // statement that created this. The caller is responsible for adding

@@ -221,11 +221,13 @@ ok:
 	CALL	runtime·schedinit(SB)
 
 	// create a new goroutine to start program
-	// runtime.main函数地址放进AX
+	// 1. 这行代码将 runtime·mainPC 的地址加载到寄存器 AX 中。runtime·mainPC 是一个符号，表示程序的主函数 runtime.main 的入口地址。
 	MOVQ	$runtime·mainPC(SB), AX		// entry
+	// 2. 这行代码将寄存器 AX 的值（即 runtime·mainPC 的地址）压入栈中。这样做是为了将主函数的入口地址作为参数传递给接下来的函数调用。
 	PUSHQ	AX
-	PUSHQ	$0			// arg size
-	// 新建一个goroutine，该goroutine绑定runtime.main，放在P的本地队列，等待调度
+	PUSHQ	$0			// arg size  这个size参数，在后面的go版本被取消了
+	// 3. 这行代码调用 runtime·newproc 函数。runtime·newproc 是 Go 运行时库中的一个函数，用于创建一个新的 goroutine。
+	// 由于之前将 runtime·mainPC 的地址压入了栈中，这个地址将作为参数传递给 runtime·newproc，表示新 goroutine 的入口函数。
 	CALL	runtime·newproc(SB)
 	POPQ	AX
 	POPQ	AX
@@ -242,6 +244,11 @@ ok:
 	MOVQ	$runtime·debugCallV1(SB), AX
 	RET
 
+// mainPC is a function value for runtime.main, to be passed to newproc.
+// The reference to runtime.main is made via ABIInternal, since the
+// actual function (not the ABI0 wrapper) is needed by newproc.
+// 这段汇编代码定义了一个名为 runtime·mainPC 的全局变量，它保存了 runtime.main 函数的地址。
+// 这个地址将被传递给 newproc 函数，用于创建一个新的 goroutine 来运行 runtime.main 函数。
 DATA	runtime·mainPC+0(SB)/8,$runtime·main(SB)
 GLOBL	runtime·mainPC(SB),RODATA,$8
 
