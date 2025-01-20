@@ -375,6 +375,9 @@ func sigaction(sig uint32, new *usigactiont, old *usigactiont) {
 }
 func sigaction_trampoline()
 
+/*
+	这段代码展示了一个 Go 函数 sigprocmask，它通过调用 C 库函数 sigprocmask 来操作信号屏蔽字。
+*/
 //go:nosplit
 //go:cgo_unsafe_args
 func sigprocmask(how uint32, new *sigset, old *sigset) {

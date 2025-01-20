@@ -174,17 +174,25 @@ func goenvs() {
 	goenvs_unix()
 }
 
+/*
+	这段代码是 Go 运行时中用于创建新操作系统线程的函数 newosproc 的实现。
+	它使用了 POSIX 线程库（pthread）来创建新线程，并进行了一些必要的初始化和错误处理。
+*/
 // May run with m.p==nil, so write barriers are not allowed.
 //go:nowritebarrierrec
 func newosproc(mp *m) {
+	// 获取 mp.g0 的栈顶指针。
 	stk := unsafe.Pointer(mp.g0.stack.hi)
+	// 这段代码永远不会执行，但它包含了一些调试信息，可以在需要时启用。
 	if false {
 		print("newosproc stk=", stk, " m=", mp, " g=", mp.g0, " id=", mp.id, " ostk=", &mp, "\n")
 	}
 
 	// Initialize an attribute object.
+	// 声明一个 pthreadattr 变量，用于存储线程属性。
 	var attr pthreadattr
 	var err int32
+	// 初始化线程属性对象。如果失败，写入错误信息并退出程序。
 	err = pthread_attr_init(&attr)
 	if err != 0 {
 		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
@@ -192,15 +200,19 @@ func newosproc(mp *m) {
 	}
 
 	// Find out OS stack size for our own stack guard.
+	// 声明一个变量 stacksize，用于存储栈大小。
 	var stacksize uintptr
+	// 获取线程栈大小。如果失败，写入错误信息并退出程序。
 	if pthread_attr_getstacksize(&attr, &stacksize) != 0 {
 		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
 		exit(1)
 	}
+	// 将获取到的栈大小赋值给 mp.g0.stack.hi。
 	mp.g0.stack.hi = stacksize // for mstart
 	//mSysStatInc(&memstats.stacks_sys, stacksize) //TODO: do this?
 
 	// Tell the pthread library we won't join with this thread.
+	// 设置线程为分离状态，这样线程结束时资源会自动释放。如果失败，写入错误信息并退出程序。
 	if pthread_attr_setdetachstate(&attr, _PTHREAD_CREATE_DETACHED) != 0 {
 		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))
 		exit(1)
@@ -208,9 +220,20 @@ func newosproc(mp *m) {
 
 	// Finally, create the thread. It starts at mstart_stub, which does some low-level
 	// setup and then calls mstart.
+	// NOTE:
+	// 新创建的线程将从一个名为 mstart_stub 的函数开始执行。
+	// mstart_stub 是用汇编实现，负责执行一些必要的低级操作，以确保线程能够正确运行。
+	// 在完成低级设置后，mstart_stub 将调用另一个名为 mstart 的函数。
+	// mstart 会调用 schedule，获取G和执行G。
+
+	// NOTE：在创建线程之前和之后，使用 sigprocmask 设置信号掩码，以确保线程创建过程不被信号中断。
+
 	var oset sigset
+	// 设置信号掩码，阻止所有信号，并保存旧的信号掩码。
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
+	// 调用 pthread_create 函数创建一个新线程。
 	err = pthread_create(&attr, funcPC(mstart_stub), unsafe.Pointer(mp))
+	// 恢复旧的信号掩码。
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 	if err != 0 {
 		write(2, unsafe.Pointer(&failthreadcreate[0]), int32(len(failthreadcreate)))

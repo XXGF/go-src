@@ -415,30 +415,46 @@ TEXT runtime·fcntl_trampoline(SB),NOSPLIT,$0
 // mstart_stub is the first function executed on a new thread started by pthread_create.
 // It just does some low-level setup and then calls mstart.
 // Note: called with the C calling convention.
+// 这段代码是 Go 运行时中的 mstart_stub 函数的实现，它是新线程由 pthread_create 启动后执行的第一个函数。
+// 它负责一些低级别的初始化工作，然后调用 mstart 函数。
+// 该函数使用 C 调用约定（C calling convention）进行调用。
 TEXT runtime·mstart_stub(SB),NOSPLIT,$0
 	// DI points to the m.
 	// We are already on m's g0 stack.
 
-	// Save callee-save registers.
-	SUBQ	$40, SP
-	MOVQ	BX, 0(SP)
-	MOVQ	R12, 8(SP)
-	MOVQ	R13, 16(SP)
-	MOVQ	R14, 24(SP)
-	MOVQ	R15, 32(SP)
+    // 在计算机体系结构中，寄存器是处理器中用于存储临时数据的高速存储单元。
+    // 不同的调用约定（calling conventions）规定了函数调用过程中哪些寄存器需要由调用者（caller）保存，哪些寄存器需要由被调用者（callee）保存。
+    // 这些约定确保了函数调用的正确性和数据的一致性。
 
+	// Save callee-save registers.
+	// 保存 被调用者保存的寄存器（callee-save registers），
+	// 也称为非易失性寄存器（non-volatile registers），
+	// 是指在函数调用过程中，如果被调用的函数（callee）需要使用这些寄存器，它必须在使用之前保存它们的值，
+	// 并在返回之前恢复它们的值。这些寄存器的值在函数调用前后应该保持不变。
+	SUBQ	$40, SP
+	MOVQ	BX, 0(SP)   // 将 BX 寄存器的值保存到栈上。
+	MOVQ	R12, 8(SP)  // 将 R12 寄存器的值保存到栈上。
+	MOVQ	R13, 16(SP) // 将 R13 寄存器的值保存到栈上。
+	MOVQ	R14, 24(SP) // 将 R14 寄存器的值保存到栈上。
+	MOVQ	R15, 32(SP) // 将 R15 寄存器的值保存到栈上。
+
+    // 将 m 结构体中的 g0 字段（表示当前线程的 g0 协程）加载到 DX 寄存器。
 	MOVQ	m_g0(DI), DX // g
 
 	// Initialize TLS entry.
 	// See cmd/link/internal/ld/sym.go:computeTLSOffset.
+	// 将 DX 寄存器的值（即 g0 协程）存储到线程局部存储（TLS）中。0x30(GS) 是 TLS 的偏移量。
 	MOVQ	DX, 0x30(GS)
 
 	// Someday the convention will be D is always cleared.
+	// 清除方向标志（DF），确保字符串操作指令从低地址向高地址方向处理数据。
 	CLD
 
+    // 调用 mstart 函数，mstart 是 Go 运行时中的一个函数，用于启动新的 M（机器，代表一个操作系统线程）。
 	CALL	runtime·mstart(SB)
 
 	// Restore callee-save registers.
+	// 恢复 被调用者保存的寄存器
 	MOVQ	0(SP), BX
 	MOVQ	8(SP), R12
 	MOVQ	16(SP), R13
@@ -448,9 +464,11 @@ TEXT runtime·mstart_stub(SB),NOSPLIT,$0
 	// Go is all done with this OS thread.
 	// Tell pthread everything is ok (we never join with this thread, so
 	// the value here doesn't really matter).
+	// 将 AX 寄存器清零。这个值将作为线程的返回值传递给 pthread 库，但由于线程是分离状态（detached），这个值实际上不会被使用。
 	XORL	AX, AX
-
+    // 释放之前为保存寄存器分配的栈空间。
 	ADDQ	$40, SP
+	// 返回，结束当前线程的执行。
 	RET
 
 // These trampolines help convert from Go calling convention to C calling convention.
