@@ -461,6 +461,11 @@ TEXT runtime·mstart_stub(SB),NOSPLIT,$0
 	MOVQ	24(SP), R14
 	MOVQ	32(SP), R15
 
+    // 当从runtime.mstart调用返回，表示:
+    // Go 运行时已经完成了对这个操作系统线程的所有操作。这个线程即将结束，不再需要执行任何 Go 代码。
+    // 在通知 pthread 库时，返回值并不重要，因为这个线程是分离状态（detached），不会被其他线程 join（等待其结束）。
+    // 在 pthread 库中，线程可以被创建为分离状态，这意味着它们在结束时会自动清理资源，而不需要其他线程显式地等待它们结束。
+
 	// Go is all done with this OS thread.
 	// Tell pthread everything is ok (we never join with this thread, so
 	// the value here doesn't really matter).
