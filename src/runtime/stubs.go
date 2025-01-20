@@ -309,6 +309,11 @@ func getcallersp() uintptr // implemented as an intrinsic on all platforms
 // pointer from a well-known register (DX on x86 architecture, etc.) directly.
 func getclosureptr() uintptr
 
+/*
+	asmcgocall 函数是 Go 运行时中的一个底层函数，它的主要作用是切换到系统栈并调用指定的 C 函数。
+	由于它涉及底层的栈操作和系统调用，用汇编语言实现。
+	其实现代码在 asm_amd64.s 等汇编文件中
+*/
 //go:noescape
 func asmcgocall(fn, arg unsafe.Pointer) int32
 

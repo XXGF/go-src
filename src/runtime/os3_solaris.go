@@ -13,6 +13,19 @@ import (
 //go:cgo_export_dynamic runtime.etext _etext
 //go:cgo_export_dynamic runtime.edata _edata
 
+/*
+	在 Go 1.15 版本中，//go:cgo_import_dynamic 是一个特殊的注释，用于在 Go 代码中导入 C 函数。这个注释的语法和功能如下：
+
+	libc_pthread_create 是在 Go 代码中使用的标识符，用于引用 C 函数 pthread_create。
+	pthread_create 是要导入的 C 函数的名称。
+	"libc.so" 指定了包含该函数的共享库的名称。在这个例子中，libc.so 是标准 C 库的共享库，通常在 Unix/Linux 系统中使用。
+	具体来说，这行代码的作用是告诉 Go 编译器在运行时动态链接 libc.so 中的 pthread_create 函数，并将其映射到 Go 代码中的 libc_pthread_create 标识符。这样，Go 代码就可以调用 libc_pthread_create，实际上它会调用 C 的 pthread_create 函数。
+
+	pthread_create 是 POSIX 线程库中的一个函数，用于创建新线程。通过这种方式，Go 可以利用底层的线程功能，增强其并发能力。
+
+	总结一下，这行代码的主要目的是在 Go 代码中引入 C 的线程创建功能，以便在 Go 程序中使用。
+*/
+
 //go:cgo_import_dynamic libc____errno ___errno "libc.so"
 //go:cgo_import_dynamic libc_clock_gettime clock_gettime "libc.so"
 //go:cgo_import_dynamic libc_exit exit "libc.so"

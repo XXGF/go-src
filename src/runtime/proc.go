@@ -144,6 +144,13 @@ var main_init_done chan bool
 //go:linkname main_main main.main
 func main_main()
 
+/*
+	mainStarted 只在runtime.main函数中，被设置为true的。
+	mainStarted 是一个全局变量，用于指示主 goroutine 是否已经启动。这个变量通常用于控制某些初始化操作的执行顺序，确保在主 goroutine 启动之前或之后执行特定的操作。
+	mainStarted 变量在 Go 运行时中有几个关键的用途：
+	1. 初始化控制：在 Go 运行时初始化过程中，有些操作需要在主 goroutine 启动之前完成，而有些操作则需要在主 goroutine 启动之后进行。mainStarted 变量用于区分这两种情况。
+	2. 调度器行为：在 Go 的调度器中，mainStarted 变量可以用于控制调度器的行为。例如，在主 goroutine 启动之前，调度器可能需要执行一些特殊的初始化操作。
+*/
 // mainStarted indicates that the main M has started.
 var mainStarted bool
 
@@ -193,7 +200,8 @@ func main() {
 	}
 
 	// Allow newproc to start new Ms.
-	// 这个变量的设置允许 newproc 函数启动新的 M（操作系统线程）。
+	// mainStarted 设置为true，表示主协程已启动。
+	// 主协程启动之后，才允许 newproc 函数启动新的 M（操作系统线程）。
 	mainStarted = true
 
 	/*
@@ -598,6 +606,12 @@ func releaseSudog(s *sudog) {
 	releasem(mp)
 }
 
+/*
+	funcPC 是一个 Go 语言中的函数，用于获取函数值 f 的入口程序计数器（PC）。
+	这个函数假设 f 是一个函数值，否则其行为是未定义的。
+	需要注意的是，在使用插件的程序中，funcPC 可能会返回不同的值，即使是同一个函数，因为在地址空间中可能存在多个相同函数的副本。
+	因此，不能将 funcPC 的结果用于 == 表达式中，只能将其结果用作开始执行代码的地址。
+*/
 // funcPC returns the entry PC of the function f.
 // It assumes that f is a func value. Otherwise the behavior is undefined.
 // CAREFUL: In programs with plugins, funcPC can return different values
@@ -607,6 +621,8 @@ func releaseSudog(s *sudog) {
 // use the result as an address at which to start executing code.
 //go:nosplit
 func funcPC(f interface{}) uintptr {
+	// efaceOf 是一个内部函数，用于获取接口值的底层表示。efaceOf(&f).data 返回接口值是 f 的数据部分的指针。
+	// 将数据部分的指针转换为 uintptr 类型，并解引用以获取函数的入口程序计数器（PC）。
 	return *(*uintptr)(efaceOf(&f).data)
 }
 
@@ -651,11 +667,18 @@ func lockedOSThread() bool {
 	return gp.lockedm != 0 && gp.m.lockedg != 0
 }
 
+/*
+	allgs 是一个包含所有曾经创建过的 Goroutine（简称 G）的切片。
+	这个切片包括了所有状态的 Goroutine，包括已经完成执行的（dead）Goroutine。由于 allgs 包含了所有曾经创建过的 Goroutine，因此它的大小只会增加，不会缩小。
+
+	注意：这个不是可运行G的全局队列。
+*/
 var (
 	allgs    []*g
 	allglock mutex
 )
 
+// 用于将一个新的 goroutine 结构体 g 添加到全局的 goroutine 列表中。
 func allgadd(gp *g) {
 	if readgstatus(gp) == _Gidle {
 		throw("allgadd: bad status Gidle")
@@ -2236,6 +2259,7 @@ func mspinning() {
 func startm(_p_ *p, spinning bool) {
 	lock(&sched.lock)
 	if _p_ == nil {
+		// 从空闲p列表中获取p
 		_p_ = pidleget()
 		if _p_ == nil {
 			// 如果没有空闲的 P，解锁并检查 spinning 标志。
@@ -2252,7 +2276,7 @@ func startm(_p_ *p, spinning bool) {
 			return
 		}
 	}
-	// 尝试获取一个 M（mget）。
+	// 尝试从空闲m列表中，获取一个 M（mget）。
 	mp := mget()
 	// 解锁 sched.lock。
 	unlock(&sched.lock)
@@ -2263,7 +2287,9 @@ func startm(_p_ *p, spinning bool) {
 			// The caller incremented nmspinning, so set m.spinning in the new M.
 			fn = mspinning
 		}
+		// 这里会调用到C库的pthread_create函数，来创建系统线程
 		newm(fn, _p_)
+		// 这里创建完就直接返回了
 		return
 	}
 	if mp.spinning {
@@ -2279,6 +2305,7 @@ func startm(_p_ *p, spinning bool) {
 	mp.spinning = spinning
 	mp.nextp.set(_p_)
 	// 唤醒 M（notewakeup(&mp.park)）。
+	// 不是调用C库的pthread_create创建的线程，才需要唤醒操作。
 	notewakeup(&mp.park)
 }
 
@@ -2363,11 +2390,12 @@ func wakep() {
 		return
 	}
 	// be conservative about spinning threads
-	// 如果当前有自旋线程（sched.nmspinning 不为 0），则直接返回，不做任何操作。
+	// 如果当前有自旋线程（sched.nmspinning 不为 0），即有自旋的M，直接返回，不做任何操作。
 	// 如果没有自旋线程，尝试将 sched.nmspinning 从 0 设置为 1，表示将启动一个新的自旋线程。启动失败也返回。
 	if atomic.Load(&sched.nmspinning) != 0 || !atomic.Cas(&sched.nmspinning, 0, 1) {
 		return
 	}
+	// 如果没有空闲p，这个函数会直接返回，不会开启新的m
 	startm(nil, true)
 }
 
@@ -4053,9 +4081,14 @@ func syscall_runtime_AfterExec() {
 
 // Allocate a new g, with a stack big enough for stacksize bytes.
 func malg(stacksize int32) *g {
+	// New一个 g struct的对象
 	newg := new(g)
 	if stacksize >= 0 {
+		// round2 是一个函数，用于将栈大小向上对齐到 2 的幂次方。
+		// _StackSystem 表示在特定操作系统上为每个栈添加的额外字节数。这些额外的字节用于操作系统特定的目的，例如信号处理。
+		// 这行代码的作用是计算总的栈大小，并将其向上对齐到 2 的幂次方。
 		stacksize = round2(_StackSystem + stacksize)
+		// 这行代码的作用是在系统栈上分配 stacksize 大小的栈空间，并将其赋值给 newg.stack。
 		systemstack(func() {
 			// 调用 runtime.stackalloc 分配一个大小足够栈内存空间，
 			// 根据线程缓存和申请栈的大小，该函数会通过三种不同的方法分配栈空间
@@ -4064,7 +4097,9 @@ func malg(stacksize int32) *g {
 			// 3.如果栈空间较大并且 runtime.stackLarge 空间不足，在堆上申请一片大小足够内存空间；
 			newg.stack = stackalloc(uint32(stacksize))
 		})
+		// 这行代码的作用是设置 newg 的栈保护边界 stackguard0，用于检测栈溢出。
 		newg.stackguard0 = newg.stack.lo + _StackGuard
+		// ^uintptr(0) 是一个特殊的值，表示无穷大。
 		newg.stackguard1 = ^uintptr(0)
 		// Clear the bottom word of the stack. We record g
 		// there on gsignal stack during VDSO on ARM and ARM64.
@@ -4111,12 +4146,13 @@ func newproc(siz int32, fn *funcval) {
 		// 获取当前的 P（处理器）的指针，并将其存储在 _p_ 变量中。
 		_p_ := getg().m.p.ptr()
 		// 将新的 goroutine 放入 P 的运行队列中，等待调度执行。
-		// runqput 函数负责将 goroutine 放入运行队列。
+		// runqput 函数负责将 goroutine 放入运行队列。如果next参数为true，则放入p的runnext中。
 		runqput(_p_, newg, true)
 
 		// 如果主 goroutine 已经启动，则调用 wakep 函数唤醒一个处理器，以便尽快调度新的 goroutine。
 		// mainStarted 是一个全局变量，指示主 goroutine 是否已经启动。
 		if mainStarted {
+			// 注意：wakep函数中会根据情况，启动新的M
 			wakep()
 		}
 	})
@@ -4138,13 +4174,24 @@ func newproc(siz int32, fn *funcval) {
 //
 //go:systemstack
 func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerpc uintptr) *g {
+	/*
+		这里注意：
+		因为newproc1切换到了系统栈上执行，所以会切换到g0，只有g0才能在系统栈上执行。
+		所以 _g_ 应该是g0，而 callergp 则是调用newproc1函数的G。两者是不一样的。
+
+		只有g0才能在系统栈上执行，所以：
+		在使用 //go:systemstack 指令的函数中，getg 返回的通常是 g0。
+	*/
 	_g_ := getg()
 
 	if fn == nil {
 		_g_.m.throwing = -1 // do not dump full stacks
 		throw("go of nil func value")
 	}
+	// 获取当前G关联的m，这里会给m上锁，防止m被抢占或调用到其他G
 	acquirem() // disable preemption because it can be holding p in a local var
+	// 这行代码的作用是将 siz 向上对齐到 8 字节的边界。
+	// 具体来说，它先将 siz 加 7，然后使用按位与非操作 &^ 清除最低的 3 位（即 &^ 7），从而实现 8 字节对齐。这是为了确保参数在内存中的对齐要求，避免潜在的性能问题或错误。
 	siz := narg
 	siz = (siz + 7) &^ 7
 
@@ -4152,15 +4199,21 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 	// Not worth it: this is almost always an error.
 	// 4*sizeof(uintreg): extra space added below
 	// sizeof(uintreg): caller's LR (arm) or return address (x86, in gostartcall).
+	// _StackMin 是 Go 运行时中定义的最小栈大小常量。
+	// 4*sys.RegSize 和 sys.RegSize 是额外的空间，用于存储一些运行时信息和返回地址。
 	if siz >= _StackMin-4*sys.RegSize-sys.RegSize {
 		throw("newproc: function arguments too large for new goroutine")
 	}
 
 	_p_ := _g_.m.p.ptr()
+	// 从当前p的空闲g列表中，获取一个g。这些g都是可以重用的g。
 	newg := gfget(_p_)
 	if newg == nil {
+		// 用于分配一个新的 goroutine 结构体 g，并为其分配一个足够大的栈空间。
 		newg = malg(_StackMin)
+		// 将g的状态从 _Gidle 更改为 _Gdead
 		casgstatus(newg, _Gidle, _Gdead)
+		// 将g添加到全局队列
 		allgadd(newg) // publishes with a g->status of Gdead so GC scanner doesn't look at uninitialized stack.
 	}
 	if newg.stack.hi == 0 {
@@ -4215,6 +4268,7 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 	if isSystemGoroutine(newg, false) {
 		atomic.Xadd(&sched.ngsys, +1)
 	}
+	// 将New g 的状态更改为 _Grunnable
 	casgstatus(newg, _Gdead, _Grunnable)
 
 	if _p_.goidcache == _p_.goidcacheend {
@@ -5633,14 +5687,23 @@ func mput(mp *m) {
 	checkdead()
 }
 
+/*
+	用于从 midle 列表中获取一个空闲的 m（工作线程）。
+	1.尝试从 midle 列表中获取一个 m。
+	2.调度器必须被锁定，以确保线程安全。
+	3.该函数可能在 STW（Stop The World）期间运行，因此不允许使用写屏障。
+*/
 // Try to get an m from midle list.
 // Sched must be locked.
 // May run during STW, so write barriers are not allowed.
 //go:nowritebarrierrec
 func mget() *m {
+	// 从调度器的空闲工作线程列表 sched.midle 中获取一个工作线程。
 	mp := sched.midle.ptr()
 	if mp != nil {
+		// 将空闲工作线程列表的头部更新为下一个空闲工作线程。
 		sched.midle = mp.schedlink
+		// 将空闲工作线程计数 sched.nmidle 减 1。
 		sched.nmidle--
 	}
 	return mp
@@ -5730,14 +5793,24 @@ func pidleput(_p_ *p) {
 	atomic.Xadd(&sched.npidle, 1) // TODO: fast atomic
 }
 
+/*
+	用于从 _Pidle 列表中获取一个空闲的 p（处理器）。
+	1. 尝试从 _Pidle 列表中获取一个 p。
+	2. 调度器必须被锁定，以确保线程安全。
+	3. 该函数可能在 STW（Stop The World）期间运行，因此不允许使用写屏障。
+*/
 // Try get a p from _Pidle list.
 // Sched must be locked.
 // May run during STW, so write barriers are not allowed.
 //go:nowritebarrierrec
 func pidleget() *p {
+	// 从调度器的空闲处理器列表 sched.pidle 中获取一个处理器。
 	_p_ := sched.pidle.ptr()
 	if _p_ != nil {
+		// 将空闲处理器列表的头部更新为下一个空闲处理器。
+		// _p_.link 指向下一个空闲处理器。
 		sched.pidle = _p_.link
+		// 使用原子操作将空闲处理器计数 sched.npidle 减 1。
 		atomic.Xadd(&sched.npidle, -1) // TODO: fast atomic
 	}
 	return _p_
@@ -5771,40 +5844,67 @@ func runqempty(_p_ *p) bool {
 // assumptions.
 const randomizeScheduler = raceenabled
 
+/*
+	用于将一个 goroutine g 放入本地可运行队列中。
+	它根据 next 参数决定是将 g 放在队列的尾部还是放在 _p_ 的 runnext 槽中。
+	如果本地队列已满，则将 g 放入全局队列中。这个函数只能由拥有该 P（处理器）的线程执行。
+*/
 // runqput tries to put g on the local runnable queue.
 // If next is false, runqput adds g to the tail of the runnable queue.
 // If next is true, runqput puts g in the _p_.runnext slot.
 // If the run queue is full, runnext puts g on the global queue.
 // Executed only by the owner P.
 func runqput(_p_ *p, gp *g, next bool) {
+	// randomizeScheduler 是一个布尔值，表示是否启用随机化调度。
+	// fastrand()%2 == 0：使用快速随机数生成器生成一个随机数，并检查其是否为偶数。
+	// 如果启用了随机化调度且 next 为 true，并且随机数为偶数，则将 next 设置为 false。
+	// 也就是说：如果启用了随机化调度，则有一定概率【50%】将 next 设置为 false，以避免总是将 goroutine 放在 runnext 槽中。
 	if randomizeScheduler && next && fastrand()%2 == 0 {
 		next = false
 	}
 
 	if next {
 	retryNext:
+		// oldnext := _p_.runnext：读取 _p_ 的 runnext 槽的当前值。
 		oldnext := _p_.runnext
+		// cas 是一个原子操作，用于将 _p_.runnext 的值从 oldnext 更改为 gp。
 		if !_p_.runnext.cas(oldnext, guintptr(unsafe.Pointer(gp))) {
+			// 如果 CAS 操作失败，则跳转到 retryNext 标签，重试操作。
 			goto retryNext
 		}
+		// if oldnext == 0：如果 oldnext 为 0，表示 runnext 槽之前是空的。
 		if oldnext == 0 {
+			// 直接返回，因为 gp 已成功放入 runnext 槽中。
 			return
 		}
 		// Kick the old runnext out to the regular run queue.
+		// 如果 oldnext 不为 0，则将 oldnext 转换为 g 指针，并将其赋值给 gp。
+		// 这行代码的作用是将之前在 runnext 槽中的 goroutine oldnext 放入常规的运行队列中。
 		gp = oldnext.ptr()
 	}
 
+	// retry:：标签，用于在操作失败时重试。
 retry:
+	/* 这段代码的功能是：将 goroutine gp 放入本地运行队列的逻辑。*/
 	h := atomic.LoadAcq(&_p_.runqhead) // load-acquire, synchronize with consumers
 	t := _p_.runqtail
+	// 队列未满，则执行一下操作： 将 gp 放入队列的尾部位置。
 	if t-h < uint32(len(_p_.runq)) {
+		// t%uint32(len(_p_.runq)) 计算队列的实际索引。
+		// set 方法用于设置队列中的元素。
 		_p_.runq[t%uint32(len(_p_.runq))].set(gp)
+		// 更新队列尾部索引:
+		// 使用原子操作更新 _p_.runqtail 的值。
+		// StoreRel（存储-释放）操作确保新元素对消费者可见。
 		atomic.StoreRel(&_p_.runqtail, t+1) // store-release, makes the item available for consumption
 		return
 	}
+	// 处理本地运行队列已满的情况:
+	// runqputslow 是一个函数，用于将 gp 放入全局运行队列中。
 	if runqputslow(_p_, gp, h, t) {
 		return
 	}
+	// 重试上述操作
 	// the queue is not full, now the put above must succeed
 	goto retry
 }

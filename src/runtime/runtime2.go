@@ -586,13 +586,20 @@ type m struct {
 	syscalltick   uint32
 	freelink      *m // on sched.freem
 
+	// 这些字段被放在这里是因为它们太大了，不能放在低级别 NOSPLIT 函数的栈上。
 	// these are here because they are too large to be on the stack
 	// of low-level NOSPLIT functions.
-	libcall   libcall
+	// 注意：库调用是指调用外部库函数，例如 C 库函数。
+	// 用于存储 库调用参数的结构体。
+	libcall libcall
+	// 用于 CPU 分析器的程序计数器（Program Counter）。
 	libcallpc uintptr // for cpu profiler
+	// 用于存储库调用时的栈指针（Stack Pointer）。
 	libcallsp uintptr
-	libcallg  guintptr
-	syscall   libcall // stores syscall parameters on windows
+	// 用于存储库调用时的 goroutine 指针。
+	libcallg guintptr
+	// 用于存储系统调用参数的结构体（在 Windows 上使用）。
+	syscall libcall // stores syscall parameters on windows
 
 	vdsoSP uintptr // SP for traceback while in VDSO call (0 if not in call)
 	vdsoPC uintptr // PC for traceback while in VDSO call
@@ -662,6 +669,10 @@ type p struct {
 	// 3. 优化性能：通过减少调度延迟和高效利用时间片，runnext 可以优化系统的整体性能，确保 Goroutine 能够更快地得到调度和执行。
 	runnext guintptr
 
+	/*
+		在 Go 语言的运行时系统中，gFree 结构体用于管理可用的 Goroutine（简称 G），这些 Goroutine 的状态为 Gdead。
+		Gdead 状态表示这些 Goroutine 已经完成执行并且可以被重新使用。通过重用 Goroutine，可以减少创建和销毁 Goroutine 的开销，从而提高性能。
+	*/
 	// Available G's (status == Gdead)
 	gFree struct {
 		gList

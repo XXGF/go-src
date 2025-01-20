@@ -442,10 +442,19 @@ func timediv(v int64, div int32, rem *int32) int32 {
 
 // Helpers for Go. Must be NOSPLIT, must only call NOSPLIT functions, and must not block.
 
+/*
+	acquirem 函数是一个非常底层的函数，用于获取当前 goroutine 关联的 M（machine）。
+	M 是 Go 运行时中的一个抽象概念，表示一个操作系统线程。acquirem 函数通过增加锁计数来防止当前 M 被抢占。
+*/
+// //go:nosplit 指令告诉编译器在调用这个函数时不要进行栈分裂（stack splitting）。
+// 这是因为 acquirem 函数可能在非常底层的运行时环境中被调用，栈分裂可能会导致递归调用和死锁等问题。
 //go:nosplit
 func acquirem() *m {
 	_g_ := getg()
+	// _g_.m.locks++ 这行代码增加了当前 M 的锁计数。
+	// 锁计数用于防止当前 M 被抢占或调度到其他 goroutine。通过增加锁计数，可以确保当前 M 在执行关键代码段时不会被中断。
 	_g_.m.locks++
+	// return _g_.m 返回当前 goroutine 关联的 M 结构体。
 	return _g_.m
 }
 

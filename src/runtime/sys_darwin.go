@@ -6,6 +6,12 @@ package runtime
 
 import "unsafe"
 
+/*
+	libcCall 是 Go 语言运行时中的一个函数，用于调用 C 库函数（libc 函数）。
+	这个函数的实现涉及一些底层的细节，包括切换到系统栈、保存调用点信息以便进行性能分析和回溯等。
+
+	libcCall 是 Go 运行时系统中的一个函数，用于调用底层的 C 库函数。它接受两个参数：一个是 C 函数的地址，另一个是传递给 C 函数的参数。
+*/
 // Call fn with arg as its argument. Return what fn returns.
 // fn is the raw pc value of the entry point of the desired function.
 // Switches to the system stack, if not already there.
@@ -13,16 +19,22 @@ import "unsafe"
 //go:nosplit
 func libcCall(fn, arg unsafe.Pointer) int32 {
 	// Leave caller's PC/SP/G around for traceback.
+	// 获取当前的 Goroutine。
 	gp := getg()
+	// 获取当前 Goroutine 所在的 M（Machine）。
 	var mp *m
 	if gp != nil {
 		mp = gp.m
 	}
+	// 如果 mp 不为 nil 且 mp.libcallsp 为 0，表示这是第一次调用 libcCall，需要保存调用点信息。
 	if mp != nil && mp.libcallsp == 0 {
+		// 保存当前 Goroutine。
 		mp.libcallg.set(gp)
+		//  保存调用者的程序计数器（PC）。
 		mp.libcallpc = getcallerpc()
 		// sp must be the last, because once async cpu profiler finds
 		// all three values to be non-zero, it will use them
+		// 保存调用者的栈指针（SP）。
 		mp.libcallsp = getcallersp()
 	} else {
 		// Make sure we don't reset libcallsp. This makes
@@ -43,7 +55,10 @@ func libcCall(fn, arg unsafe.Pointer) int32 {
 		// profile signal, which is the one that uses the libcall* info.
 		mp = nil
 	}
+	// 调用底层的汇编函数 asmcgocall，实际执行 C 函数调用。fn就是要调用的C函数
 	res := asmcgocall(fn, arg)
+	// 如果 mp 不为 nil，在调用完成后清除 mp.libcallsp，表示调用结束。
+	// asmcgocall 函数负责切换到系统栈并调用指定的 C 函数。
 	if mp != nil {
 		mp.libcallsp = 0
 	}
@@ -164,12 +179,56 @@ func pthread_attr_setdetachstate(attr *pthreadattr, state int) int32 {
 }
 func pthread_attr_setdetachstate_trampoline()
 
+/*
+	这段代码定义了一个 pthread_create 函数，用于创建一个新的线程。它使用了 Go 的 libcCall 函数来调用底层的 C 库函数 pthread_create。
+	此外，还定义了一个 pthread_create_trampoline 函数，作为调用 pthread_create 的中间跳板。
+
+
+*/
 //go:nosplit
 //go:cgo_unsafe_args
 func pthread_create(attr *pthreadattr, start uintptr, arg unsafe.Pointer) int32 {
+	// 使用 libcCall 函数调用底层的 C 库函数 pthread_create。
+	// funcPC(pthread_create_trampoline)：获取 pthread_create_trampoline 函数的程序计数器（PC）。
+	// unsafe.Pointer(&attr)：将 attr 的地址转换为 unsafe.Pointer 类型，并传递给 libcCall。
 	return libcCall(unsafe.Pointer(funcPC(pthread_create_trampoline)), unsafe.Pointer(&attr))
 }
 func pthread_create_trampoline()
+
+// func pthread_create_trampoline()：声明一个名为 pthread_create_trampoline 的空函数。
+// 这个函数的具体实现通常在汇编代码中定义，用于将 Go 函数调用转换为 C 函数调用。
+// 汇编实现如下：
+/*
+TEXT runtime·pthread_create_trampoline(SB),NOSPLIT,$0
+	PUSHQ	BP
+	MOVQ	SP, BP
+	SUBQ	$16, SP
+	MOVQ	0(DI), SI	// arg 2 attr
+	MOVQ	8(DI), DX	// arg 3 start
+	MOVQ	16(DI), CX	// arg 4 arg
+	MOVQ	SP, DI		// arg 1 &threadid (which we throw away)
+	CALL	libc_pthread_create(SB)
+	MOVQ	BP, SP
+	POPQ	BP
+	RET
+*/
+/*
+	//go:cgo_import_dynamic libc_pthread_create pthread_create "/usr/lib/libSystem.B.dylib"
+
+	//go:cgo_import_dynamic 是一个编译指示（directive），用于告诉 Go 编译器如何处理动态链接库中的符号。
+	具体来说，它用于导入动态链接库中的符号，以便在 Go 代码中使用这些符号。
+
+	1. //go:cgo_import_dynamic: 这是一个编译指示，告诉 Go 编译器导入一个动态链接库中的符号。cgo 是 Go 中用于与 C 语言进行互操作的工具。
+	2. libc_pthread_create: 这是在 Go 代码中使用的符号名称。通过这个名称，Go 代码可以引用动态链接库中的 pthread_create 函数。
+	3. pthread_create: 这是动态链接库中的实际符号名称。在这个例子中，它是标准 C 库中的 pthread_create 函数。
+	4. "/usr/lib/libSystem.B.dylib": 这是动态链接库的路径。在 macOS 系统上，libSystem.B.dylib 是包含标准 C 库函数的动态链接库。
+
+	背景：
+	在 macOS 系统上，libSystem.B.dylib 是一个核心动态链接库，包含了许多基础的系统函数，包括线程管理、文件操作、内存管理等。pthread_create 是其中的一个函数，用于创建新的线程。
+
+	使用场景：
+	在 Go 运行时中，有时需要直接调用操作系统提供的底层函数，例如线程创建函数 pthread_create。为了实现这一点，Go 运行时需要导入这些函数的符号，以便在 Go 代码中调用它们。
+*/
 
 //go:nosplit
 //go:cgo_unsafe_args
@@ -446,6 +505,24 @@ func setNonblock(fd int32) {
 
 // Tell the linker that the libc_* functions are to be found
 // in a system library, with the libc_ prefix missing.
+
+/*
+	//go:cgo_import_dynamic libc_pthread_create pthread_create "/usr/lib/libSystem.B.dylib"
+
+	//go:cgo_import_dynamic 是一个编译指示（directive），用于告诉 Go 编译器如何处理动态链接库中的符号。
+	具体来说，它用于导入动态链接库中的符号，以便在 Go 代码中使用这些符号。
+
+	1. //go:cgo_import_dynamic: 这是一个编译指示，告诉 Go 编译器导入一个动态链接库中的符号。cgo 是 Go 中用于与 C 语言进行互操作的工具。
+	2. libc_pthread_create: 这是在 Go 代码中使用的符号名称。通过这个名称，Go 代码可以引用动态链接库中的 pthread_create 函数。
+	3. pthread_create: 这是动态链接库中的实际符号名称。在这个例子中，它是标准 C 库中的 pthread_create 函数。
+	4. "/usr/lib/libSystem.B.dylib": 这是动态链接库的路径。在 macOS 系统上，libSystem.B.dylib 是包含标准 C 库函数的动态链接库。
+
+	背景：
+	在 macOS 系统上，libSystem.B.dylib 是一个核心动态链接库，包含了许多基础的系统函数，包括线程管理、文件操作、内存管理等。pthread_create 是其中的一个函数，用于创建新的线程。
+
+	使用场景：
+	在 Go 运行时中，有时需要直接调用操作系统提供的底层函数，例如线程创建函数 pthread_create。为了实现这一点，Go 运行时需要导入这些函数的符号，以便在 Go 代码中调用它们。
+*/
 
 //go:cgo_import_dynamic libc_pthread_attr_init pthread_attr_init "/usr/lib/libSystem.B.dylib"
 //go:cgo_import_dynamic libc_pthread_attr_getstacksize pthread_attr_getstacksize "/usr/lib/libSystem.B.dylib"

@@ -62,6 +62,7 @@ functions to make sure that this limit cannot be violated.
 */
 
 const (
+	// 它表示在特定操作系统上为每个栈添加的额外字节数。这些额外的字节用于操作系统特定的目的，例如信号处理。
 	// StackSystem is a number of additional bytes to add
 	// to each stack below the usual guard area for OS-specific
 	// purposes like signal handling. Used on Windows, Plan 9,
