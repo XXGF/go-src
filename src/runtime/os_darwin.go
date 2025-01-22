@@ -70,6 +70,7 @@ func semawakeup(mp *m) {
 	pthread_mutex_lock(&mp.mutex)
 	mp.count++
 	if mp.count > 0 {
+		// 调用 pthread_cond_signal 函数，发送一个信号给 mp 结构体中的条件变量 cond。这通常用于唤醒等待该条件变量的线程。
 		pthread_cond_signal(&mp.cond)
 	}
 	pthread_mutex_unlock(&mp.mutex)

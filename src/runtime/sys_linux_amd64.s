@@ -570,38 +570,46 @@ TEXT runtime·futex(SB),NOSPLIT,$0
 
 // int32 clone(int32 flags, void *stk, M *mp, G *gp, void (*fn)(void));
 TEXT runtime·clone(SB),NOSPLIT,$0
-	MOVL	flags+0(FP), DI
-	MOVQ	stk+8(FP), SI
+	MOVL	flags+0(FP), DI // 参数一：cloneFlags
+	MOVQ	stk+8(FP), SI  // 参数二：stk，新线程的栈顶指针
 	MOVQ	$0, DX
 	MOVQ	$0, R10
 
 	// Copy mp, gp, fn off parent stack for use by child.
 	// Careful: Linux system call clobbers CX and R11.
-	MOVQ	mp+16(FP), R8
-	MOVQ	gp+24(FP), R9
-	MOVQ	fn+32(FP), R12
+	MOVQ	mp+16(FP), R8   // 参数三：m
+	MOVQ	gp+24(FP), R9   // 参数四：g0
+	MOVQ	fn+32(FP), R12  // 参数五：mstart 函数
 
-	MOVL	$SYS_clone, AX
-	SYSCALL
+	MOVL	$SYS_clone, AX  // AX 存入系统调用 SYS_clone
+	SYSCALL                 // 执行系统调用，进入内核
 
+    // 虽然这里只有一次 clone 调用，但它却返回了2次，
+    // 一次返回到父线程，一次返回到子线程，然后 2 个线程各自执行自己的代码流程。
 	// In parent, return.
-	CMPQ	AX, $0
-	JEQ	3(PC)
-	MOVL	AX, ret+40(FP)
-	RET
+	CMPQ	AX, $0  // 返回值如果是 0 则表示这是子线程
+	JEQ	3(PC)   // 跳转到子线程部分，往下跳 3
+	MOVL	AX, ret+40(FP)  // 给父线程准备返回值到 AX
+	RET // return 到父线程
 
 	// In child, on new stack.
+	// 设置 CPU 栈顶寄存器指向子线程的栈顶 stk
 	MOVQ	SI, SP
 
 	// If g or m are nil, skip Go-related setup.
+	// m，新创建的m结构体对象的地址，由父线程保存在R8寄存器中的值被复制到了子线程
 	CMPQ	R8, $0    // m
 	JEQ	nog
+	// g，m.g0的地址，由父线程保存在R9寄存器中的值被复制到了子线程
 	CMPQ	R9, $0    // g
 	JEQ	nog
 
 	// Initialize m->procid to Linux tid
+	// 通过gettid系统调用获取线程ID（tid）
 	MOVL	$SYS_gettid, AX
+	// 执行系统调用，进入内核
 	SYSCALL
+	 // 设置 m.procid = tid
 	MOVQ	AX, m_procid(R8)
 
 	// Set FS to point at m->tls.
@@ -609,16 +617,18 @@ TEXT runtime·clone(SB),NOSPLIT,$0
 	CALL	runtime·settls(SB)
 
 	// In child, set up new stack
+	// 获取当前线程的 TLS 地址
 	get_tls(CX)
 	MOVQ	R8, g_m(R9)
 	MOVQ	R9, g(CX)
-	CALL	runtime·stackcheck(SB)
+	CALL	runtime·stackcheck(SB)  // 栈检查
 
 nog:
 	// Call fn
-	CALL	R12
+	CALL	R12 // call mstart 函数，非错误情况不返回，会进入调度循环
 
 	// It shouldn't return. If it does, exit that thread.
+	// 发生错误而返回，需要退出线程
 	MOVL	$111, DI
 	MOVL	$SYS_exit, AX
 	SYSCALL

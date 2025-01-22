@@ -858,6 +858,7 @@ func mcommoninit(mp *m) {
 	}
 	mp.id = sched.mnext
 	sched.mnext++
+	// 检查已创建系统线程是否超过了数量限制（10000）
 	checkmcount()
 
 	mp.fastrand[0] = uint32(int64Hash(uint64(mp.id), fastrandseed))
@@ -866,6 +867,7 @@ func mcommoninit(mp *m) {
 		mp.fastrand[1] = 1
 	}
 
+	// 创建用于信号处理的 gsignal,从堆上分配一个 g 结构体对象，并设置栈内存
 	mpreinit(mp)
 	if mp.gsignal != nil {
 		mp.gsignal.stackguard1 = mp.gsignal.stack.lo + _StackGuard
@@ -1794,6 +1796,7 @@ func allocm(_p_ *p, fn func()) *m {
 
 	// In case of cgo or Solaris or illumos or Darwin, pthread_create will make us a stack.
 	// Windows and Plan 9 will layout sched stack on OS stack.
+	// 创建 g0 对象，并为 g0 申请 8KB 栈内存，绑定 m 和 g0
 	if iscgo || GOOS == "solaris" || GOOS == "illumos" || GOOS == "windows" || GOOS == "plan9" || GOOS == "darwin" {
 		mp.g0 = malg(-1)
 	} else {
@@ -2565,6 +2568,7 @@ func execute(gp *g, inheritTime bool) {
 		traceGoStart()
 	}
 	// 在 Go 语言中，gogo 是一个低级别的运行时函数，通常用汇编语言实现。它的主要作用是切换到指定的 goroutine 并开始执行该 goroutine 的代码。
+	// 函数循环调用链：gogo -> go(用户程序) ->goexit -> goexit1 -> mcall(goexit0)【这里从g切换到g0】 -> goexit0(gp *g) -> schedule()【Schedule只能由g0执行】；
 	gogo(&gp.sched)
 }
 
@@ -3522,9 +3526,18 @@ func goexit1() {
 	if trace.enabled {
 		traceGoEnd()
 	}
+	// mcall 主要作用是切换 g0 的执行权和栈内存，然后执行 goexit0 函数。
 	mcall(goexit0)
 }
 
+/*
+	goexit0 函数主要逻辑：
+	1. 设置 G 状态为_Gdead；
+	2. 重置 G 保存的信息，以便下一次复用；
+	3. 解绑 G 和 M 的关系；
+	4. G 被放入 P 的 freeg，等待下一次复用；
+	5. 调用 schedule 开启调度循环。
+*/
 // goexit continuation on g0.
 func goexit0(gp *g) {
 	_g_ := getg()
@@ -4256,6 +4269,9 @@ func newproc1(fn *funcval, argp unsafe.Pointer, narg int32, callergp *g, callerp
 	memclrNoHeapPointers(unsafe.Pointer(&newg.sched), unsafe.Sizeof(newg.sched))
 	newg.sched.sp = sp
 	newg.stktopsp = sp
+	/*
+		newg.sched.pc 被设置成了 goexit 函数的第二条指令的地址而不是 fn.fn，这是为什么呢？
+	*/
 	newg.sched.pc = funcPC(goexit) + sys.PCQuantum // +PCQuantum so that previous instruction is in same function
 	newg.sched.g = guintptr(unsafe.Pointer(newg))
 	gostartcallfn(&newg.sched, fn)
@@ -5920,14 +5936,21 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 	if n != uint32(len(_p_.runq)/2) {
 		throw("runqputslow: queue is not full")
 	}
+	// 取出 p 本地队列的一半，放到batch中。本地队列的实现是循环队列。
 	for i := uint32(0); i < n; i++ {
 		batch[i] = _p_.runq[(h+i)%uint32(len(_p_.runq))].ptr()
 	}
+	// 这里存在并发，会有其他 p 过来偷 g
+	// 如果 cas 操作失败，说明已经有其它工作线程
+	// 从 p 的本地运行队列偷走了一些 goroutine
+	// 所以直接返回，让 p 继续 retry 就行
 	if !atomic.CasRel(&_p_.runqhead, h, h+n) { // cas-release, commits consume
 		return false
 	}
+	// 要入队的g，连同从本地队列取的一般g
 	batch[n] = gp
 
+	// 增加调度的随机性，随机打乱一下顺序
 	if randomizeScheduler {
 		for i := uint32(1); i <= n; i++ {
 			j := fastrandn(i + 1)
@@ -5936,6 +5959,8 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 	}
 
 	// Link the goroutines.
+	// 全局运行队列是一个链表，这里首先把所有需要放入全局运行队列的 g 链接起来，
+	// 减少后面对全局链表的锁住时间，从而降低锁冲突
 	for i := uint32(0); i < n; i++ {
 		batch[i].schedlink.set(batch[i+1])
 	}
@@ -5943,6 +5968,8 @@ func runqputslow(_p_ *p, gp *g, h, t uint32) bool {
 	q.head.set(batch[0])
 	q.tail.set(batch[n])
 
+	// runqputslow 函数并没有一开始就把全局运行队列锁住，而是等所有的准备工作做完之后才锁住全局运行队列，
+	// 这是并发编程加锁的基本原则，需要尽量减小锁的粒度，降低锁冲突的概率。
 	// Now put the batch on global queue.
 	lock(&sched.lock)
 	globrunqputbatch(&q, int32(n+1))

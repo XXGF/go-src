@@ -353,7 +353,7 @@ type gobuf struct {
 	// and restores it doesn't need write barriers. It's still
 	// typed as a pointer so that any other writes from Go get
 	// write barriers.
-	sp   uintptr  // 栈指针
+	sp   uintptr  // g的栈顶
 	pc   uintptr  // 程序计数器：运行到的程序位置
 	g    guintptr // 持有gobuf的Goroutine
 	ctxt unsafe.Pointer

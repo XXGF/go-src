@@ -145,6 +145,8 @@ func notewakeup(n *note) {
 	for {
 		v = atomic.Loaduintptr(&n.key)
 		// 使用原子比较并交换操作 atomic.Casuintptr 尝试将 n.key 从 v 设置为 locked。
+		// 是为了使被唤醒的线程，可以通过查看该值是否等于1，来确定是被其它线程唤醒，还是意外从睡眠中苏醒了过来。
+		// 如果该值为 1 则表示是被唤醒的，可以继续工作了，但如果该值为 0，则表示是意外苏醒，需要抛出异常。
 		if atomic.Casuintptr(&n.key, v, locked) {
 			break
 		}

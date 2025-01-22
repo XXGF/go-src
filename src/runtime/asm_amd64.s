@@ -286,12 +286,13 @@ TEXT runtime·gosave(SB), NOSPLIT, $0-8
 
 // func gogo(buf *gobuf)
 // restore state from Gobuf; longjmp
+// gogo(&gp.sched)
 TEXT runtime·gogo(SB), NOSPLIT, $16-8
-	MOVQ	buf+0(FP), BX		// gobuf
-	MOVQ	gobuf_g(BX), DX
+	MOVQ	buf+0(FP), BX		// gobuf 对应 gp.sched
+	MOVQ	gobuf_g(BX), DX  // DX = gp.sched.g
 	MOVQ	0(DX), CX		// make sure g != nil
-	get_tls(CX)
-	MOVQ	DX, g(CX)
+	get_tls(CX)  // 获取线程本地存储地址，里边存着 g0
+	MOVQ	DX, g(CX)   // 把当前 g 写入 tls，替代 g0
 	MOVQ	gobuf_sp(BX), SP	// restore SP
 	MOVQ	gobuf_ret(BX), AX
 	MOVQ	gobuf_ctxt(BX), DX

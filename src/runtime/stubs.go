@@ -51,6 +51,14 @@ func getg() *g
 	逃逸分析：
 	这个函数不能标记为 go:noescape，因为如果 fn 是一个栈分配的闭包，并且 fn 将 g 放入运行队列，而 g 在 fn 返回之前执行，那么闭包在执行时将被无效化。
 */
+/*
+	汇编源码分析：
+	1. 保存当前 g 的现场环境 g.sched 中寄存器们的值，有些场景还需要唤醒 g （比如 channel）；
+	2. 校验 g !=g0；
+	3. 切换 tls 的 g 为 g0；
+	切换 g0 的栈（由于每次调用 mcall 函数切换到 g0 栈时，都是切换到 g0.sched.sp 所指的固定位置，因此 g0 栈内存是覆盖重复使用的，不会因为函数不返回问题导致爆栈）；
+	调用 goexit0 函数。
+*/
 // mcall switches from the g to the g0 stack and invokes fn(g),
 // where g is the goroutine that made the call.
 // mcall saves g's current PC/SP in g->sched so that it can be restored later.
@@ -206,6 +214,18 @@ func cgocallback(fn, frame unsafe.Pointer, framesize, ctxt uintptr)
 		2. 恢复目标上下文：恢复目标 goroutine 的寄存器状态、程序计数器等上下文信息，使其能够继续执行。
 		3. 切换执行：通过切换上下文，CPU 开始执行目标 goroutine 的代码。
 
+	gogo 函数做了什么：
+		1. g0 调用 gogo() 函数时，首先将线程 tls 的 g0 替换为了 g；
+		2. 然后通过设置 CPU 的栈顶寄存器 SP 为 g.sched.sp，实现了从 g0 栈到 g 栈的切换；
+			保存了其他 gobuf 内的寄存器到 CPU 对应的寄存器，为后续调用 g 做准备；
+		3.最后从 g 中取出 g.sched.pc 的值，并通过 JMP 指令从 runtime 代码直接跳转到用户代码执行，完成了 CPU 执行权的转让。
+
+		还记得 g.sched.pc 指向的了啥不？
+		g.sched.pc 指向了 go 关键字后边的函数的 fn.fn 指针，也就是执行的第一条指令，cpu 从这里开始运行起来了用户程序代码
+
+		当用户代码正常运行结束，又会发生什么呢？
+		用户代码执行完，自然会调用 RET 指令，回到 return address 处继续执行。
+		那 return address 又指向的了哪里呢？ return address 指向了 CALL runtime·goexit1(SB) 。因此正常结束的 G 会从这里继续开始执行 goexit1 函数。
 */
 func gogo(buf *gobuf)
 func gosave(buf *gobuf)

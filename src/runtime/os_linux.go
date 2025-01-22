@@ -132,12 +132,36 @@ const (
 		_CLONE_THREAD /* revisit - okay for now */
 )
 
+/*
+	1. 首先用了几条指令为 clone 系统调用准备参数，存储到父线程寄存器中；
+	第一个参数和第二个参数分别用来指定内核创建线程时需要的选项和新线程应该使用的栈。新线程使用的栈为 m.g0.stack.lo～m.g0.stack.hi 这段内存。
+	参数三和参数四分别是与新线程绑定的 m对象和 g0，
+	参数五表示 mstart 函数，存储在 R12 寄存器中，这个后边会用到。
+
+	2. 使用 SYSCALL 指令进入系统内核，通过 SYS_clone 系统调用创建子线程；
+	父子线程共享进程地址空间，父线程的寄存器会被复制一份给子线程，这样参数就会随着寄存器被传递。
+
+	3.SYS_clone 系统调用创建完子线程后，会返回两次结果，一次返回到父线程，一次返回到子线程，然后 2 个线程各自执行自己的代码流程；
+	当返回值 AX = 0 时，表示为子线程，否则为父线程；
+	父线程结束 clone 任务后，将返回值放入 AX 中，最终执行了 RET，至此父线程回到 newosproc 函数继续执行其他逻辑。
+
+	4. 子线程则跳转到后面的代码继续执行，进行后续的初始化工作，首先进行了栈内存的切换工作；
+	该场景下寄存器中的 m 和 g0 不为 0，所以略过检查函数；
+	随后通过系统调用获取子线程 ID，绑定到 m.procid；绑定 m 和 g0，使用 get_tls(CX) 获取当前线程的 TLS 地址，使用 MOVQ R9, g(CX) 绑定线程 tls 和 g0 的关系，R14 寄存器指向了 g0。
+
+	5. 最后通过 CALL R12 调用 mstart，此后整个调度循环就可以运行起来了。
+*/
 //go:noescape
 func clone(flags int32, stk, mp, gp, fn unsafe.Pointer) int32
 
+/*
+	newosproc 函数是 Go 运行时系统的一部分，用于创建新的操作系统线程（OS thread）。
+
+*/
 // May run with m.p==nil, so write barriers are not allowed.
 //go:nowritebarrier
 func newosproc(mp *m) {
+	// 获取 mp 结构体中 g0 Goroutine 的栈顶指针，并将其转换为 unsafe.Pointer 类型，存储在 stk 变量中。
 	stk := unsafe.Pointer(mp.g0.stack.hi)
 	/*
 	 * note: strace gets confused if we use CLONE_PTRACE here.
@@ -148,9 +172,16 @@ func newosproc(mp *m) {
 
 	// Disable signals during clone, so that the new thread starts
 	// with signals disabled. It will enable them in minit.
+	// 定义一个 sigset 类型的变量 oset，用于存储信号掩码。
 	var oset sigset
+	// 调用 sigprocmask 函数，设置当前线程的信号掩码为 sigset_all，并将旧的信号掩码存储在 oset 中。这样可以在 clone 调用期间禁用信号。
 	sigprocmask(_SIG_SETMASK, &sigset_all, &oset)
+	// 调用 clone 函数创建一个新的操作系统线程。
+	// cloneFlags 是用于 clone 调用的标志，
+	// stk 是新线程的栈顶指针，
+	// mp、mp.g0 和 funcPC(mstart) 分别是传递给新线程的参数。
 	ret := clone(cloneFlags, stk, unsafe.Pointer(mp), unsafe.Pointer(mp.g0), unsafe.Pointer(funcPC(mstart)))
+	// 调用 sigprocmask 函数，恢复旧的信号掩码 oset。
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 
 	if ret < 0 {
