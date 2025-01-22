@@ -67,6 +67,13 @@ func getg() *g
 // closure will be invalidated while it is still executing.
 func mcall(fn func(*g))
 
+/*
+	systemstack 函数用于在系统栈上运行指定的函数 fn。
+
+	如果 systemstack 是从每个操作系统线程的栈（g0 栈）或信号处理栈（gsignal 栈）调用的，systemstack 会直接调用 fn 并返回。
+	否则，systemstack 是从普通 Goroutine 的有限栈调用的。在这种情况下，systemstack 会切换到每个操作系统线程的栈，调用 fn，然后再切换回来。
+	通常使用函数字面量作为参数，以便与调用 systemstack 的代码共享输入和输出。
+*/
 // systemstack runs fn on a system stack.
 // If systemstack is called from the per-OS-thread (g0) stack, or
 // if systemstack is called from the signal handling (gsignal) stack,

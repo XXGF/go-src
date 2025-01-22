@@ -338,6 +338,15 @@ TEXT runtime·mcall(SB), NOSPLIT, $0-8
 	JMP	AX
 	RET
 
+// 这段代码定义了一个虚拟的 systemstack_switch 函数，它的主要作用是作为一个标记，区分 G 栈底和系统栈顶的例程。
+// 通过在 G 栈底放置这个虚拟函数，Go 运行时可以在栈遍历时识别出栈的边界。
+// 具体来说，当 systemstack 函数被调用时，它会切换到系统栈执行代码，并在 G 栈底放置 systemstack_switch。
+// 这样，当 Go 运行时需要遍历栈时，可以通过识别 systemstack_switch 来确定栈的边界，避免遍历到系统栈的顶部。
+
+// systemstack_switch 是一个虚拟例程，当 systemstack 函数被调用时，它会被留在 G（Goroutine）的栈底。
+// systemstack 是 Go 运行时用于切换到系统栈执行代码的函数。
+// 我们需要区分位于 G 栈底的例程和位于系统栈顶的例程，因为位于系统栈顶的例程会终止栈遍历（stack walk）。
+// 栈遍历是 Go 运行时用于调试、垃圾回收等操作的一部分。
 // systemstack_switch is a dummy routine that systemstack leaves at the bottom
 // of the G stack. We need to distinguish the routine that
 // lives at the bottom of the G stack from the one that lives
@@ -348,52 +357,94 @@ TEXT runtime·systemstack_switch(SB), NOSPLIT, $0-0
 
 // func systemstack(fn func())
 TEXT runtime·systemstack(SB), NOSPLIT, $0-8
+    // 将传入的函数指针 fn 存储在寄存器 DI 中。
 	MOVQ	fn+0(FP), DI	// DI = fn
+	// 获取线程本地存储（TLS）的地址，并存储在寄存器 CX 中。
 	get_tls(CX)
+	// 从 TLS 中获取当前 Goroutine 的指针，并存储在寄存器 AX 中。
 	MOVQ	g(CX), AX	// AX = g
+	// 获取当前 Goroutine 所属的 M（操作系统线程）的指针，并存储在寄存器 BX 中。
 	MOVQ	g_m(AX), BX	// BX = m
 
+    // 比较当前 Goroutine 的指针（AX）和 M 的信号处理 Goroutine 的指针（m_gsignal）。
+    // 如果相等，跳转到 noswitch 标签。即不需要进行栈切换。
 	CMPQ	AX, m_gsignal(BX)
 	JEQ	noswitch
 
+    // 获取 M 的 g0 Goroutine 的指针，并存储在寄存器 DX 中。
 	MOVQ	m_g0(BX), DX	// DX = g0
+	// 比较当前 Goroutine 的指针（AX）和 g0 Goroutine 的指针（DX）。
+    // 如果相等，跳转到 noswitch 标签。
 	CMPQ	AX, DX
 	JEQ	noswitch
 
+    // 比较当前 Goroutine 的指针（AX）和 M 当前正在运行的 Goroutine 的指针（m_curg）。
+    // 如果不相等，跳转到 bad 标签。
 	CMPQ	AX, m_curg(BX)
 	JNE	bad
 
+    // systemstack 函数在切换栈时保存当前 Goroutine 状态的过程。因为只有g0才能系统栈上执行，所以需要先保存当前G的状态，然后再切换到g0
+    // 这段代码的主要目的是保存当前 Goroutine 的状态，以便在切换回这个 Goroutine 时能够恢复其状态。具体来说，它将以下信息保存到 g->sched
 	// switch stacks
 	// save our state in g->sched. Pretend to
 	// be systemstack_switch if the G stack is scanned.
+	// 将 runtime·systemstack_switch 函数的地址存储在寄存器 SI 中。
+	// 这个地址将被用作当前 Goroutine 的程序计数器（PC），以便在栈扫描时能够识别出这是一个系统栈切换点。
 	MOVQ	$runtime·systemstack_switch(SB), SI
+	// 将 SI 中的值（即 runtime·systemstack_switch 的地址）存储到当前 Goroutine 的 sched 结构中的 gobuf_pc 字段。
 	MOVQ	SI, (g_sched+gobuf_pc)(AX)
+	// 将当前栈指针（SP）存储到当前 Goroutine 的 sched 结构中的 gobuf_sp 字段。
+    // 这样可以在切换回这个 Goroutine 时恢复其栈指针。
 	MOVQ	SP, (g_sched+gobuf_sp)(AX)
+	// 将当前 Goroutine 的指针（AX）存储到 sched 结构中的 gobuf_g 字段。
+    // 这样可以在切换回这个 Goroutine 时知道它是哪个 Goroutine。
 	MOVQ	AX, (g_sched+gobuf_g)(AX)
+	// 将当前基址指针（BP）存储到 sched 结构中的 gobuf_bp 字段。
+    // 这样可以在切换回这个 Goroutine 时恢复其基址指针。
 	MOVQ	BP, (g_sched+gobuf_bp)(AX)
 
+    // 这段汇编代码展示了 systemstack 函数在切换到 g0 栈并执行传入的函数后，再切换回原始 Goroutine 栈的过程。
 	// switch to g0
+	// 将 g0 Goroutine 的指针（DX）存储到 TLS 中的 g 字段。
 	MOVQ	DX, g(CX)
+	// 将 g0 Goroutine 的 sched 结构中的栈指针（gobuf_sp）存储到寄存器 BX 中。
 	MOVQ	(g_sched+gobuf_sp)(DX), BX
 	// make it look like mstart called systemstack on g0, to stop traceback
+	// 将 BX 减去 8 字节，为 runtime·mstart 函数的地址腾出空间。
 	SUBQ	$8, BX
+	// 将 runtime·mstart 函数的地址存储到寄存器 DX 中。以便在栈扫描时能够识别出这是一个系统栈切换点。
 	MOVQ	$runtime·mstart(SB), DX
+	// 将 runtime·mstart 函数的地址存储到 BX 指向的内存位置。
 	MOVQ	DX, 0(BX)
+	// 将 BX 的值（即新的栈指针）存储到 SP 中，切换到 g0 的栈。
 	MOVQ	BX, SP
 
+    // 调用目标函数
 	// call target function
+	// 将传入的函数指针（DI）存储到寄存器 DX 中。
 	MOVQ	DI, DX
+	// 将 DI 指向的内存位置的值存储到 DI 中，这里是为了获取函数指针。
 	MOVQ	0(DI), DI
+	// 调用传入的函数。
 	CALL	DI
 
+    // 切换回原始 Goroutine 栈
 	// switch back to g
+	// 获取线程本地存储（TLS）的地址，并存储在寄存器 CX 中。
 	get_tls(CX)
+	// 从 TLS 中获取当前 Goroutine 的指针，并存储在寄存器 AX 中。
 	MOVQ	g(CX), AX
+	// 获取当前 Goroutine 所属的 M（操作系统线程）的指针，并存储在寄存器 BX 中。
 	MOVQ	g_m(AX), BX
+	// 获取 M 当前正在运行的 Goroutine 的指针，并存储在寄存器 AX 中。
 	MOVQ	m_curg(BX), AX
+	// 将当前 Goroutine 的指针（AX）存储到 TLS 中的 g 字段。
 	MOVQ	AX, g(CX)
+	// 将当前 Goroutine 的 sched 结构中的栈指针（gobuf_sp）存储到 SP 中，切换回原始 Goroutine 的栈。
 	MOVQ	(g_sched+gobuf_sp)(AX), SP
+	// 将当前 Goroutine 的 sched 结构中的 gobuf_sp 字段清零。
 	MOVQ	$0, (g_sched+gobuf_sp)(AX)
+	// 返回，结束 systemstack 函数的执行。
 	RET
 
 noswitch:
