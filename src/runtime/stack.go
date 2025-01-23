@@ -944,6 +944,21 @@ func round2(x int32) int32 {
 // stack growth from other nowritebarrierrec functions, but the
 // compiler doesn't check this.
 //
+/*
+	TEXT runtime·morestack_noctxt(SB),NOSPLIT,$0
+	......
+	// Call newstack on m->g0's stack.
+	// 切换到 g0 栈，并设置 tls 的 g 为 g0
+	MOVQ	m_g0(BX), BX
+	MOVQ	BX, g(CX)
+	MOVQ	(g_sched+gobuf_sp)(BX), SP
+	// 执行之后 CPU 就开始使用 g0 的栈了，然后 call newstack
+	CALL	runtime·newstack(SB)
+	CALL	runtime·abort(SB)	// crash if newstack returns
+	RET
+
+	morestack_noctxt 是栈扩张检查函数，如果确认栈要扩展，则调用 newstack 函数
+*/
 //go:nowritebarrierrec
 func newstack() {
 	thisg := getg()
@@ -1004,6 +1019,7 @@ func newstack() {
 	// If the GC is in some way dependent on this goroutine (for example,
 	// it needs a lock held by the goroutine), that small preemption turns
 	// into a real deadlock.
+	// 如果是发起的抢占请求,而非真正的栈扩张检查
 	if preempt {
 		if !canPreemptM(thisg.m) {
 			// Let the goroutine keep running for now.
@@ -1051,7 +1067,13 @@ func newstack() {
 			preemptPark(gp) // never returns
 		}
 
+		/*
+			通过对这种协作式抢占的分析也可以看出，这种抢占是保守式的抢占，优先级低于运行时，还需要函数调用协作执行，
+			所以这种抢占方式有一个很明显的缺点：一个没有主动放弃执行权、且不参与任何函数调用的函数，直到执行完毕之前， 是不会被抢占的。
+			因此，为了解决这个问题，Go 后续推出了基于信号的抢占方式。
+		*/
 		// Act like goroutine called runtime.Gosched.
+		// gopreempt_m 类似于主动调度的 Gosched，和其执行逻辑一致。
 		gopreempt_m(gp) // never return
 	}
 

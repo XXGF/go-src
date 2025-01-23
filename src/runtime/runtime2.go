@@ -611,6 +611,9 @@ type m struct {
 
 	// Whether this is a pending preemption signal on this M.
 	// Accessed atomically.
+	// signalPending 字段用于指示当前是否有一个待处理的抢占信号（preemption signal）。
+	// 在 Go 的运行时系统中，抢占信号通常用于中断正在执行的 goroutine，以便进行调度或其他操作。
+	// signalPending 字段的访问是原子的（atomic）。
 	signalPending uint32
 
 	dlogPerM

@@ -109,17 +109,20 @@ var signalsOK bool
 //go:nosplit
 //go:nowritebarrierrec
 func initsig(preinit bool) {
+	// 如果 preinit 为 false，则设置 signalsOK 为 true，表示现在可以安全地运行信号处理程序。
 	if !preinit {
 		// It's now OK for signal handlers to run.
 		signalsOK = true
 	}
 
+	// 如果当前是以归档（archive）或共享库（shared library）形式运行，并且 preinit 为 false，则直接返回，不进行信号初始化。
 	// For c-archive/c-shared this is called by libpreinit with
 	// preinit == true.
 	if (isarchive || islibrary) && !preinit {
 		return
 	}
 
+	// 遍历所有信号（从 0 到 _NSIG，通常是系统定义的信号数量）。
 	for i := uint32(0); i < _NSIG; i++ {
 		t := &sigtable[i]
 		if t.flags == 0 || t.flags&_SigDefault != 0 {
@@ -128,8 +131,10 @@ func initsig(preinit bool) {
 
 		// We don't need to use atomic operations here because
 		// there shouldn't be any other goroutines running yet.
+		// 获取与指定信号编号 i 相关的信号处理程序的地址。
 		fwdSig[i] = getsig(i)
 
+		// 如果没有安装 Go 的信号处理程序，则根据当前信号的处理程序设置信号栈（setsigstack(i)）或初始化被忽略的信号（sigInitIgnored(i)）。
 		if !sigInstallGoHandler(i) {
 			// Even if we are not installing a signal handler,
 			// set SA_ONSTACK if necessary.
@@ -141,7 +146,9 @@ func initsig(preinit bool) {
 			continue
 		}
 
+		// 如果安装了 Go 的信号处理程序，则将 handlingSig[i] 设置为 1，表示正在处理信号。
 		handlingSig[i] = 1
+		// 设置信号处理函数
 		setsig(i, funcPC(sighandler))
 	}
 }
@@ -326,15 +333,24 @@ func sigpipe() {
 func doSigPreempt(gp *g, ctxt *sigctxt) {
 	// Check if this G wants to be preempted and is safe to
 	// preempt.
+	// 这个函数检查当前 goroutine（gp）是否希望被异步预先中断。
+	// 如果返回 true，则表示该 goroutine 处于可以被中断的状态。
 	if wantAsyncPreempt(gp) {
+		// 如果 goroutine 允许被中断，接下来调用 isAsyncSafePoint 函数来检查当前的程序计数器（PC）、栈指针（SP）和链接寄存器（LR）是否处于安全点。
+		// 如果返回 ok 为 true，则表示可以安全地进行预先中断。
 		if ok, newpc := isAsyncSafePoint(gp, ctxt.sigpc(), ctxt.sigsp(), ctxt.siglr()); ok {
 			// Adjust the PC and inject a call to asyncPreempt.
+			// 如果可以安全地进行预先中断，调用 ctxt.pushCall(funcPC(asyncPreempt), newpc)。
+			// 这行代码将异步预先中断的调用【即asyncPreempt函数的调用】注入到当前的调用栈中，并将程序计数器调整为 newpc。
+			// 这样，当 goroutine 恢复执行时，它将调用 asyncPreempt 函数。
 			ctxt.pushCall(funcPC(asyncPreempt), newpc)
 		}
 	}
 
 	// Acknowledge the preemption.
+	// 这行代码增加了 gp.m.preemptGen 的值，表示发生了一次预先中断。这是一个原子操作，确保在并发环境中安全。
 	atomic.Xadd(&gp.m.preemptGen, 1)
+	// 这行代码将 gp.m.signalPending 设置为 0，表示当前没有待处理的信号。
 	atomic.Store(&gp.m.signalPending, 0)
 }
 
@@ -349,6 +365,7 @@ const preemptMSupported = true
 // 收到请求后，如果正在运行的G或P被标记为抢占，并且goroutine处于异步安全点，它将抢占goroutine。
 // 在处理抢占请求后，它总是以原子方式递增mp.preemptGen。
 
+// 调用方描述：
 // 0. 在触发垃圾回收的栈扫描时会调用 runtime.suspendG 挂起 Goroutine，该函数会执行下面的逻辑：
 // 0.1 将 _Grunning 状态的 Goroutine 标记成可以被抢占，即将 preemptStop 设置成 true；
 // 0.2 调用 runtime.preemptM 触发抢占；
@@ -375,6 +392,8 @@ func preemptM(mp *m) {
 		// 5. 汇编指令 runtime.asyncPreempt 会调用运行时函数 runtime.asyncPreempt2；
 		// 6. runtime.asyncPreempt2 会调用 runtime.preemptPark；
 		// 7. runtime.preemptPark 会修改当前 Goroutine 的状态到 _Gpreempted 并调用 runtime.schedule 让当前函数陷入休眠并让出线程，调度器会选择其它的 Goroutine 继续执行；
+
+		// 发送 _SIGURG 信号
 		signalM(mp, sigPreempt)
 	}
 }
@@ -406,6 +425,13 @@ func sigFetchG(c *sigctxt) *g {
 	return getg()
 }
 
+/*
+	这个函数是信号处理的关键部分，负责在接收到信号时进行适当的处理。
+
+	函数目的: sigtrampgo 是从汇编语言编写的信号处理函数 sigtramp 调用的。它在信号处理期间被调用，可能会在“世界停止”的状态下执行。
+	栈分割: 由于 getg() 仍然返回信号到达时正在运行的 goroutine（如果有的话），并且通常在 gsignal 栈上调用，因此这个函数必须标记为 nosplit。在切换到 gsignal 之前，栈边界检查将无法正常工作。
+	写屏障: //go:nowritebarrierrec 指令表示在这个函数中不需要写屏障。
+*/
 // sigtrampgo is called from the signal handler function, sigtramp,
 // written in assembly code.
 // This is called by the signal handler, and the world may be stopped.
@@ -429,6 +455,11 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 			sigprofNonGoPC(c.sigpc())
 			return
 		}
+		/*
+			sigPreempt 信号处理:
+			如果信号是 sigPreempt，并且支持预先中断（preemptMSupported）且没有禁用异步预先中断（debug.asyncpreemptoff），则直接返回。
+			这表明信号是在执行 Go 代码时发送的，但在执行非 Go 代码时接收到的，因此不需要进一步处理。
+		*/
 		if sig == sigPreempt && preemptMSupported && debug.asyncpreemptoff == 0 {
 			// This is probably a signal from preemptM sent
 			// while executing Go code but received while
@@ -444,6 +475,9 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 		return
 	}
 
+	// 注意：gsignal 协程，是在这里起作用的。
+	// 这里是切换当前线程的 Goroutine 上下文，使其变为 gsignal Goroutine。
+	// 这在信号处理程序中非常重要，因为信号处理程序需要在一个特殊的 Goroutine 上运行，以避免干扰正常的 Goroutine 调度和执行。
 	setg(g.m.gsignal)
 
 	// If some non-Go code called sigaltstack, adjust.
@@ -458,6 +492,7 @@ func sigtrampgo(sig uint32, info *siginfo, ctx unsafe.Pointer) {
 	}
 
 	c.fixsigcode(sig)
+	// 调用 sighandler(sig, info, ctx, g)，这是实际的信号处理程序，它会根据信号类型和上下文执行相应的处理逻辑。
 	sighandler(sig, info, ctx, g)
 	setg(g)
 	if setStack {
@@ -520,6 +555,11 @@ var crashing int32
 var testSigtrap func(info *siginfo, ctxt *sigctxt, gp *g) bool
 var testSigusr1 func(gp *g) bool
 
+/*
+	函数目的
+		信号处理: sighandler 函数在信号发生时被调用。它在 gsignal goroutine 上运行，并使用备用信号栈。参数 sig、info 和 ctxt 是来自系统信号处理程序的参数，表示信号类型、信号信息和上下文。
+		写屏障: 由于垃圾收集器可能已经停止了世界，因此在这个函数中不允许使用写屏障。
+*/
 // sighandler is invoked when a signal occurs. The global g will be
 // set to a gsignal goroutine and we will be running on the alternate
 // signal stack. The parameter g will be the value of the global g
@@ -532,6 +572,8 @@ var testSigusr1 func(gp *g) bool
 //
 //go:nowritebarrierrec
 func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
+	// gp：代表在信号发生时正在运行的 Goroutine，用于获取信号发生时的上下文信息。
+	// _g_：代表当前正在执行的 Goroutine，通常是一个 gsignal Goroutine，用于处理信号。
 	_g_ := getg()
 	c := &sigctxt{info, ctxt}
 
@@ -548,7 +590,8 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 		return
 	}
 
-	// 程序启动时，在 runtime.sighandler 函数中注册 SIGURG 信号的处理函数 runtime.doSigPreempt ???
+	// 处理 sigPreempt 信号: 如果接收到的是 sigPreempt 信号，并且异步预先中断没有被禁用（debug.asyncpreemptoff == 0），
+	// 则调用 doSigPreempt(gp, c) 进行处理。这个函数会处理 goroutine 的预先中断。
 	if sig == sigPreempt && debug.asyncpreemptoff == 0 {
 		// Might be a preemption signal.
 		doSigPreempt(gp, c)
@@ -1023,6 +1066,19 @@ func sigfwdgo(sig uint32, info *siginfo, ctx unsafe.Pointer) bool {
 	return true
 }
 
+/*
+	保存信号掩码: msigsave 函数的主要作用是保存当前线程的信号掩码到 mp.sigmask 中。
+	这个操作是为了在非 Go 线程调用 Go 函数时，能够保留非 Go 线程的信号掩码。
+
+	注意：在 msigsave 函数中，sigprocmask 的调用确实不会将 mp.sigmask 设置为 nil。
+
+	sigprocmask 是一个系统调用，用于操作当前线程的信号掩码。它的参数如下：
+	第一个参数: _SIG_SETMASK 表示我们要设置信号掩码。
+	第二个参数: nil 表示我们不想更改当前的信号掩码，只是想获取当前的信号掩码。
+	第三个参数: &mp.sigmask 是一个指向 mp.sigmask 的指针，表示我们希望将当前线程的信号掩码保存到 mp.sigmask 中。
+
+	当调用 sigprocmask 时，当前线程的信号掩码会被读取并存储到 mp.sigmask 中。mp.sigmask 不会被设置为 nil，而是会被设置为当前线程的实际信号掩码。
+*/
 // msigsave saves the current thread's signal mask into mp.sigmask.
 // This is used to preserve the non-Go signal mask when a non-Go
 // thread calls a Go function.
@@ -1099,6 +1155,9 @@ func minitSignalStack() {
 	}
 }
 
+/*
+	minitSignalMask，用于在初始化一个新的 M（操作系统线程）时设置线程的信号掩码。
+*/
 // minitSignalMask is called when initializing a new m to set the
 // thread's signal mask. When this is called all signals have been
 // blocked for the thread.  This starts with m.sigmask, which was set
@@ -1108,12 +1167,21 @@ func minitSignalStack() {
 // signals to not be blocked. Then it sets the thread's signal mask.
 // After this is called the thread can receive signals.
 func minitSignalMask() {
+	// nmask := getg().m.sigmask 获取当前 Goroutine 所属的 M 的信号掩码。
+	// getg() 返回当前 Goroutine 的指针，通过 getg().m 获取当前 Goroutine 所属的 M。
 	nmask := getg().m.sigmask
+	// 遍历信号表 sigtable。sigtable 是一个包含所有信号信息的表。
 	for i := range sigtable {
+		// 检查信号 i 是否是可阻塞的信号。blockableSig 是一个函数，用于判断信号是否可以被阻塞。
 		if !blockableSig(uint32(i)) {
+			// 删除不可阻塞的信号。
+			// 不可阻止，意味着无法由信号处理函数处理，需要去除
+			// nmask虽然是个uint32类型，但它存储的是信号集
 			sigdelset(&nmask, i)
 		}
 	}
+	// 设置当前线程的信号掩码为 nmask。即替换为删除了不可阻塞信号的信号集。
+	// sigprocmask 是一个系统调用，用于设置或获取线程的信号掩码。_SIG_SETMASK 表示设置新的信号掩码。
 	sigprocmask(_SIG_SETMASK, &nmask, nil)
 }
 

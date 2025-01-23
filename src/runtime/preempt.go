@@ -301,6 +301,15 @@ func canPreemptM(mp *m) bool {
 
 //go:generate go run mkpreempt.go
 
+/*
+	汇编实现，汇编代码位置：runtime/preempt_amd64.s
+
+	TEXT ·asyncPreempt(SB),NOSPLIT|NOFRAME,$0-0
+	......
+	CALL ·asyncPreempt2(SB)
+
+	在汇编代码中，会调到 asyncPreempt2 函数
+*/
 // asyncPreempt saves all user registers and calls asyncPreempt2.
 //
 // When stack scanning encounters an asyncPreempt frame, it scans that
@@ -309,15 +318,27 @@ func canPreemptM(mp *m) bool {
 // asyncPreempt is implemented in assembly.
 func asyncPreempt()
 
+/*
+	asyncPreempt2 函数用于处理异步预先中断的逻辑。
+*/
 //go:nosplit
 func asyncPreempt2() {
+	// 获取当前 goroutine: getg() 函数返回当前正在执行的 goroutine（gp）。
 	gp := getg()
+	// 设置安全点: 将 gp.asyncSafePoint 设置为 true，表示当前 goroutine 处于异步安全点。这是为了确保在执行预先中断时，goroutine 的状态是安全的。
 	gp.asyncSafePoint = true
+
+	/*
+		处理预先中断:
+		如果 gp.preemptStop 为 true，则调用 mcall(preemptPark)。这通常表示当前 goroutine 需要被挂起，等待调度器的进一步指示。
+		否则，调用 mcall(gopreempt_m)，这将触发 goroutine 的预先中断，允许调度器进行上下文切换。
+	*/
 	if gp.preemptStop {
 		mcall(preemptPark)
 	} else {
 		mcall(gopreempt_m)
 	}
+	// 恢复异步安全点状态
 	gp.asyncSafePoint = false
 }
 

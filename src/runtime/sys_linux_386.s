@@ -399,6 +399,7 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$28
 	MOVL	BX, 4(SP)
 	MOVL	ctx+8(FP), BX
 	MOVL	BX, 8(SP)
+	// 这里会调到runtime·sigtrampgo
 	CALL	runtime·sigtrampgo(SB)
 
 	MOVL	di-16(SP), DI

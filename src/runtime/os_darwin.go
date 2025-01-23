@@ -303,8 +303,21 @@ func libpreinit() {
 	initsig(true)
 }
 
+/*
+	详细解释一下 mp.gsignal 是如何起作用的？
+	1. mp.gsignal 是一个指向 goroutine 的指针，专门用于处理信号的 goroutine。每个 m（操作系统线程）都有一个与之关联的信号处理 goroutine。
+	2. malg(size int) 是一个用于分配 goroutine 的内存的函数。在这里，它为 mp.gsignal 分配了 32KB 的内存。这是为了确保在处理信号时有足够的栈空间。根据注释，OS X 系统要求的最小栈大小为 8KB，因此这里分配了更大的空间以确保安全。
+	3. 这一行代码将 mp（当前的操作系统线程）赋值给 mp.gsignal.m。这意味着 mp.gsignal goroutine 将会知道它所运行的操作系统线程。这对于信号处理是重要的，因为信号处理需要在特定的线程上下文中进行。
+
+	mp.gsignal 的作用
+	信号处理: mp.gsignal goroutine 负责处理与该操作系统线程相关的信号。当操作系统接收到信号时，它会将信号传递给相应的 goroutine 进行处理。
+	上下文关联: 通过将 mp 赋值给 mp.gsignal.m，信号处理 goroutine 可以访问与其关联的操作系统线程的上下文。这对于在处理信号时执行特定的操作（如恢复状态、调度其他 goroutine 等）是必要的。
+	并发安全: Go 的运行时系统设计为在 goroutine 之间安全地处理信号。通过为每个 m 分配一个专门的信号处理 goroutine，Go 可以确保信号处理不会干扰其他 goroutine 的执行。
+
+*/
 // Called to initialize a new m (including the bootstrap m).
 // Called on the parent thread (main thread in case of bootstrap), can allocate memory.
+// 从一个父线程上进行调用（引导时为主线程），可以分配内存
 func mpreinit(mp *m) {
 	mp.gsignal = malg(32 * 1024) // OS X wants >= 8K
 	mp.gsignal.m = mp
@@ -356,19 +369,37 @@ var sigset_all = ^sigset(0)
 //go:nowritebarrierrec
 func setsig(i uint32, fn uintptr) {
 	var sa usigactiont
+	// 这行代码设置了信号处理的标志：
+	//_SA_SIGINFO: 允许信号处理程序接收额外的信息（如信号的来源）。
+	//_SA_ONSTACK: 指示信号处理程序在一个新的信号栈上执行。
+	//_SA_RESTART: 使某些系统调用在信号处理后自动重启。
 	sa.sa_flags = _SA_SIGINFO | _SA_ONSTACK | _SA_RESTART
+	// 这行代码将信号屏蔽字设置为全1，表示在处理信号时屏蔽所有信号。
 	sa.sa_mask = ^uint32(0)
 	if fn == funcPC(sighandler) {
 		if iscgo {
 			fn = funcPC(cgoSigtramp)
 		} else {
+			// 将fn设置为 sigtramp 函数的地址
+			// sigtramp 是信号处理函数
 			fn = funcPC(sigtramp)
 		}
 	}
+	// 这段代码将信号处理程序的地址存储到 sa 结构体中，并调用 sigaction 函数来注册这个信号处理程序。
+	// sigaction 是一个系统调用，用于更改信号的处理方式。
 	*(*uintptr)(unsafe.Pointer(&sa.__sigaction_u)) = fn
 	sigaction(i, &sa, nil)
 }
 
+// 汇编实现代码的地址：runtime/sys_linux_386.s 431
+/*
+	TEXT runtime·sigtramp(SB),NOSPLIT,$28
+
+	......
+
+	// 这里会调到runtime·sigtrampgo
+	CALL	runtime·sigtrampgo(SB)
+*/
 // sigtramp is the callback from libc when a signal is received.
 // It is called with the C calling convention.
 func sigtramp()
@@ -390,6 +421,9 @@ func setsigstack(i uint32) {
 	sigaction(i, &sa, nil)
 }
 
+/*
+	getsig 函数的作用是获取与指定信号编号 i 相关的信号处理程序的地址。
+*/
 //go:nosplit
 //go:nowritebarrierrec
 func getsig(i uint32) uintptr {
@@ -410,7 +444,17 @@ func sigaddset(mask *sigset, i int) {
 	*mask |= 1 << (uint32(i) - 1)
 }
 
+/*
+	sigdelset 函数用于从信号集（sigset）中删除特定的信号。
+	1. mask *sigset: 这是一个指向信号集的指针。sigset 是一个类型，通常用于表示一组信号。
+	2. i int: 这是要从信号集中删除的信号的索引。信号的索引通常是从 1 开始的，因此在函数内部需要减去 1。
+*/
 func sigdelset(mask *sigset, i int) {
+	// uint32(i) - 1：因为信号索引是从1开始，所以这里减去1，表示在信号集中，索引还是从0开始
+	// 1 << (uint32(i) - 1): 将1左移 信号索引的位数，即找到信号在信号集中的bit
+	// *mask &^= 1 << (uint32(i) - 1): &^ 操作符被称为 "位清除" 操作符（bit clear operator）。所以这里是清理 1 << (uint32(i) - 1) 位上的数据。
+
+	// 所以这个表达式的意思是，找到信号在信号集中的bit，然后清除这个bit上的数据。
 	*mask &^= 1 << (uint32(i) - 1)
 }
 
