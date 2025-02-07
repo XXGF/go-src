@@ -2341,7 +2341,13 @@ func startm(_p_ *p, spinning bool) {
 // 这个函数通常在以下情况下被调用：
 // 1. 当一个 M 进入系统调用并且需要释放其持有的 P。
 // 2. 当一个 M 被锁定到一个 G 并且需要释放其持有的 P。
-
+/*
+	handoff 会对当前的条件进行检查，如果满足下面的条件，则会调用 startm 函数，启动新的工作线程 M 来与当前的 P 进行关联，实现对 P 的接管，从而继续执行可运行的 G。
+	1. P 的本地运行队列或全局运行队列里面有待运行的 G；
+	2. 需要帮助 GC 完成标记工作；
+	3. 系统比较忙，所有其它 P 都在运行 G，需要它帮忙；
+	4. 其它 P 都已经处于空闲状态，如果需要监控网络连接读写事件，则需要启动新的 M 来接管 P，用于监控网络连接。
+*/
 //go:nowritebarrierrec
 func handoffp(_p_ *p) {
 	// handoffp must start an M in any situation where
@@ -2357,26 +2363,32 @@ func handoffp(_p_ *p) {
 		return
 	}
 	// if it has GC work, start it straight away
+	// 如果垃圾回收的 blacken 模式已启用，并且存在需要标记的工作
 	if gcBlackenEnabled != 0 && gcMarkWorkAvailable(_p_) {
 		startm(_p_, false)
 		return
 	}
 	// no local work, check that there are no spinning/idle M's,
 	// otherwise our help is not required
+	// 检查是否有其他 M 正在自旋状态，如果没有且没有空闲的 M，则尝试将一个 M 设置为自旋状态并启动它
 	if atomic.Load(&sched.nmspinning)+atomic.Load(&sched.npidle) == 0 && atomic.Cas(&sched.nmspinning, 0, 1) { // TODO: fast atomic
 		startm(_p_, true)
 		return
 	}
 	lock(&sched.lock)
+	// 检查 GC 是否正在等待
 	if sched.gcwaiting != 0 {
 		_p_.status = _Pgcstop
+		// 将 P 的状态设置为 _Pgcstop
 		sched.stopwait--
+		// 如果等待计数为 0，可以唤醒 GC 执行了
 		if sched.stopwait == 0 {
 			notewakeup(&sched.stopnote)
 		}
 		unlock(&sched.lock)
 		return
 	}
+	// 检查 P 上是否存在需要运行的 SafePoint 函数
 	if _p_.runSafePointFn != 0 && atomic.Cas(&_p_.runSafePointFn, 1, 0) {
 		sched.safePointFn(_p_)
 		sched.safePointWait--
@@ -2384,21 +2396,32 @@ func handoffp(_p_ *p) {
 			notewakeup(&sched.safePointNote)
 		}
 	}
+	// 如果全局可执行队列不为空
 	if sched.runqsize != 0 {
 		unlock(&sched.lock)
+		// 启动一个 M 来执行任务
 		startm(_p_, false)
 		return
 	}
 	// If this is the last running P and nobody is polling network,
 	// need to wakeup another M to poll network.
+	// 如果当前空闲的 P 数量为 gomaxprocs-1，并且上次轮询的时间不为零
 	if sched.npidle == uint32(gomaxprocs-1) && atomic.Load64(&sched.lastpoll) != 0 {
 		unlock(&sched.lock)
+		// 启动一个 M 来执行任务
 		startm(_p_, false)
 		return
 	}
+
+	/* 无法启动新的M来运行P*/
+
+	// 计算无障碍唤醒时间
 	if when := nobarrierWakeTime(_p_); when != 0 {
+		// wakeNetPoller 唤醒在网络轮询器中休眠的线程，如果它在 when 参数之前不被唤醒；
+		// 或者它会唤醒一个空闲的 P 来为定时器和网络轮询器提供服务（如果还没有的话）。
 		wakeNetPoller(when)
 	}
+	// 将 P 放入空闲队列
 	pidleput(_p_)
 	unlock(&sched.lock)
 }
@@ -5664,6 +5687,11 @@ func retake(now int64) uint32 {
 		// 获取 P 的状态 s。
 		s := _p_.status
 		sysretake := false
+
+		/*
+			重点：preemptone(_p_)
+			一、如果发现当前 Goroutine 的运行时间超过 10 毫秒（forcePreemptNS），则发信号抢占
+		*/
 		// 如果 P 的状态是 _Prunning 或 _Psyscall，则检查其运行时间。
 		if s == _Prunning || s == _Psyscall {
 			// Preempt G if it's running for too long.
@@ -5683,7 +5711,8 @@ func retake(now int64) uint32 {
 			}
 		}
 		/*
-			针对 s == _Psyscall 情况，当前 goroutine 正在执行系统调用，满足三个条件就会使用 handoffp(pp) 寻找一新的 m 接管 p，三个条件如下：
+			重点：handoffp(_p_)
+			二、针对 s == _Psyscall 情况，当前 goroutine 正在执行系统调用，满足三个条件就会使用 handoffp(pp) 寻找一新的 m 接管 p，三个条件如下：
 			1. P 的本地运行队列不为空，有 G 等待被调度执行；
 			2. 没有自旋的 m && 没有空闲的 P ，说明系统很繁忙；【即有P再等待执行，但没有可用的M了】
 			3. 当前系统调用时间过长，超过 10ms。
