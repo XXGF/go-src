@@ -71,12 +71,23 @@ func libcCall(fn, arg unsafe.Pointer) int32 {
 // and we need to know whether to check 32 or 64 bits of the result.
 // (Some libc functions that return 32 bits put junk in the upper 32 bits of AX.)
 
+/*
+	syscall_syscall 函数是一个用于调用系统调用的低级函数。这个函数通过直接调用操作系统的系统调用接口来执行特定的操作。
+
+*/
+// go:linkname syscall_syscall syscall.syscall:
+//	这个指令告诉编译器将 syscall_syscall 函数与 syscall.syscall 进行链接。这意味着在 Go 代码中调用 syscall.syscall 实际上会调用 syscall_syscall 函数。
+//  这种链接方式通常用于在标准库中实现一些底层功能。
 //go:linkname syscall_syscall syscall.syscall
 //go:nosplit
+// go:cgo_unsafe_args: 这个指令告诉编译器，这个函数的参数是“不安全的”，即它们可能不符合 Go 的内存安全规则。这个指令通常用于与 C 代码交互的函数。
 //go:cgo_unsafe_args
 func syscall_syscall(fn, a1, a2, a3 uintptr) (r1, r2, err uintptr) {
+	// 这个函数通知 Go 运行时系统，当前 Goroutine 正在进入一个系统调用。Go 运行时会相应地调整调度器的状态，以便在系统调用期间可以调度其他 Goroutine。
 	entersyscall()
+	// 这个函数调用是实际执行系统调用的地方。libcCall 是一个内部函数，用于调用 C 库函数或系统调用。
 	libcCall(unsafe.Pointer(funcPC(syscall)), unsafe.Pointer(&fn))
+	// 这个函数通知 Go 运行时系统，当前 Goroutine 已经完成了系统调用。Go 运行时会相应地调整调度器的状态，以便继续调度这个 Goroutine。
 	exitsyscall()
 	return
 }

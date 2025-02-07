@@ -2234,6 +2234,9 @@ func templateThread() {
 
 // Stops execution of the current m until new work is available.
 // Returns with acquired P.
+/*
+	stopm 函数的主要目的是暂停当前 M（机器线程）的执行，直到有新的工作可用。它确保在停止之前，当前 M 不持有任何锁或处理器（P），并在返回时获取一个新的 P。
+*/
 func stopm() {
 	_g_ := getg()
 
@@ -2248,11 +2251,17 @@ func stopm() {
 	}
 
 	lock(&sched.lock)
+	// 调用 mput(_g_.m) 将当前 M 放入可用 M 的列表中，表示它现在可以被其他 goroutine 使用。
 	mput(_g_.m)
 	unlock(&sched.lock)
+	// 调用 notesleep(&_g_.m.park) 使当前 M 进入休眠状态，等待被唤醒。
 	notesleep(&_g_.m.park)
+	// 调用 noteclear(&_g_.m.park) 清除与当前 M 相关的任何唤醒通知。
 	noteclear(&_g_.m.park)
+	// M从休眠中醒来：
+	// 调用 acquirep(_g_.m.nextp.ptr()) 获取下一个 P（处理器），并将当前 M 绑定到该 P。
 	acquirep(_g_.m.nextp.ptr())
+	// 将 _g_.m.nextp 设置为 0，表示当前 M 不再需要指向任何 P。
 	_g_.m.nextp = 0
 }
 
@@ -3679,26 +3688,40 @@ func save(pc, sp uintptr) {
 // Note that the increment is done even if tracing is not enabled,
 // because tracing can be enabled in the middle of syscall. We don't want the wait to hang.
 //
+/*
+	reentersyscall函数：
+	首先把现场信息保存在当前 G 的 sched 成员中；
+	然后解除 M 和 P 的绑定关系，这样 sysmon 线程就不需要加锁解除 M 和 P 的关系了，可以直接执行 handoffp 操作；
+	并设置 P 的状态为_Psyscall，前面我们已经看到 sysmon监控线程需要依赖该状态实施抢占。
+*/
 //go:nosplit
 func reentersyscall(pc, sp uintptr) {
 	_g_ := getg()
 
 	// Disable preemption because during this function g is in Gsyscall status,
 	// but can have inconsistent g->sched, do not let GC observe it.
+	// 为什么要禁用抢占（preemption）?
+	// 在进入系统调用时，goroutine 的状态可能不一致，因此需要增加锁计数以防止垃圾回收（GC）观察到不一致的状态。
 	_g_.m.locks++
 
 	// Entersyscall must not call any function that might split/grow the stack.
 	// (See details in comment above.)
 	// Catch calls that might, by replacing the stack guard with something that
 	// will trip any stack check and leaving a flag to tell newstack to die.
+	// 设置栈保护值为 stackPreempt，用于防止栈的分裂。
 	_g_.stackguard0 = stackPreempt
+	// 标记当前 goroutine 可能会抛出栈分裂异常。
 	_g_.throwsplit = true
 
 	// Leave SP around for GC and traceback.
+	// 保存当前的程序计数器和栈指针，以便后续的垃圾回收和追踪。
 	save(pc, sp)
+	// 分别保存当前的栈指针和程序计数器，以便在系统调用期间使用。
 	_g_.syscallsp = sp
 	_g_.syscallpc = pc
+	// 将当前 goroutine 的状态从 _Grunning（运行中）更改为 _Gsyscall（在系统调用中）。
 	casgstatus(_g_, _Grunning, _Gsyscall)
+	// 这段代码检查当前的栈指针是否在 goroutine 的栈范围内。如果不在范围内，调用 systemstack 进行错误处理，打印错误信息并抛出异常。
 	if _g_.syscallsp < _g_.stack.lo || _g_.stack.hi < _g_.syscallsp {
 		systemstack(func() {
 			print("entersyscall inconsistent ", hex(_g_.syscallsp), " [", hex(_g_.stack.lo), ",", hex(_g_.stack.hi), "]\n")
@@ -3706,6 +3729,7 @@ func reentersyscall(pc, sp uintptr) {
 		})
 	}
 
+	// 如果跟踪功能启用，调用 systemstack(traceGoSysCall) 进行系统栈跟踪，并保存当前的程序计数器和栈指针。
 	if trace.enabled {
 		systemstack(traceGoSysCall)
 		// systemstack itself clobbers g.sched.{pc,sp} and we might
@@ -3714,29 +3738,45 @@ func reentersyscall(pc, sp uintptr) {
 		save(pc, sp)
 	}
 
+	// 检查系统监视器是否在等待，如果是，则调用 systemstack(entersyscall_sysmon) 进行处理，并保存当前的程序计数器和栈指针。
 	if atomic.Load(&sched.sysmonwait) != 0 {
 		systemstack(entersyscall_sysmon)
 		save(pc, sp)
 	}
 
+	// 如果当前处理器的 runSafePointFn 不为零，调用 systemstack(runSafePointFn) 以运行安全点函数，并保存当前的程序计数器和栈指针。
 	if _g_.m.p.ptr().runSafePointFn != 0 {
 		// runSafePointFn may stack split if run on this stack
 		systemstack(runSafePointFn)
 		save(pc, sp)
 	}
 
+	// 将当前处理器的 syscalltick 值（用于跟踪系统调用的时间）赋值给当前 goroutine 的 m.syscalltick。这有助于在系统调用期间跟踪时间。
 	_g_.m.syscalltick = _g_.m.p.ptr().syscalltick
+	// 将 sysblocktraced 标记为 true，表示当前 goroutine 正在被系统调用阻塞，并且需要进行跟踪。
 	_g_.sysblocktraced = true
+
+	/*
+		这块代码主要是解除P和M的绑定关系
+	*/
+	// 获取当前处理器P的指针。
 	pp := _g_.m.p.ptr()
+	// 解除P和M的关联。
 	pp.m = 0
+	// 把 P 记录在 oldp 中，等从系统调用返回时，优先绑定这个 P。
 	_g_.m.oldp.set(pp)
+	// 解除M和P的关联。
 	_g_.m.p = 0
+	// 使用原子操作将处理器的状态设置为 _Psyscall，表示该处理器正在执行系统调用。
+	// sysmon 线程依赖状态实施抢占。
 	atomic.Store(&pp.status, _Psyscall)
+
+	// 检查是否有垃圾回收（GC）等待。如果有，调用 systemstack(entersyscall_gcwait) 进行处理，并保存当前的程序计数器和栈指针。
 	if sched.gcwaiting != 0 {
 		systemstack(entersyscall_gcwait)
 		save(pc, sp)
 	}
-
+	// 最后，减少锁计数，表示当前 goroutine 已经完成了系统调用的处理。
 	_g_.m.locks--
 }
 
@@ -3747,6 +3787,12 @@ func reentersyscall(pc, sp uintptr) {
 //go:nosplit
 //go:linkname entersyscall
 func entersyscall() {
+	/*
+		reentersyscall 函数是一个内部函数，用于处理进入系统调用的逻辑。它通常会执行以下操作：
+		1. 保存调用者的上下文:保存调用者的程序计数器（PC）和栈指针（SP），以便在系统调用完成后能够恢复。
+		2. 调整 Goroutine 的状态:将当前 Goroutine 的状态标记为正在进行系统调用。这样，Go 运行时系统可以在系统调用期间调度其他 Goroutine 运行。
+		3. 调整调度器的状态:通知 Go 运行时调度器当前 Goroutine 正在进行系统调用，以便调度器可以做出相应的调整。
+	*/
 	reentersyscall(getcallerpc(), getcallersp())
 }
 
@@ -3843,14 +3889,21 @@ func entersyscallblock_handoff() {
 func exitsyscall() {
 	_g_ := getg()
 
+	// 增加当前 goroutine 的锁计数，表示它正在进行系统调用的退出处理。
 	_g_.m.locks++ // see comment in entersyscall
+	// 检查当前调用栈指针是否仍在系统调用的有效范围内。如果不在，抛出异常，表示系统调用的帧不再有效。
 	if getcallersp() > _g_.syscallsp {
 		throw("exitsyscall: syscall frame is no longer valid")
 	}
 
+	// 将 waitsince 重置为 0，表示不再等待。
 	_g_.waitsince = 0
+	// 获取当前 goroutine 的旧处理器指针，然后将其清空。
 	oldp := _g_.m.oldp.ptr()
 	_g_.m.oldp = 0
+	// 调用 exitsyscallfast 函数，尝试快速退出系统调用。
+	// 这里会为M找一个空闲处理器，并绑定：先找系统调度前解绑的oldp，如果找不到，再找一个空闲的P。
+	// 找到了才会返回true，找不到返回false。
 	if exitsyscallfast(oldp) {
 		if trace.enabled {
 			if oldp != _g_.m.p.ptr() || _g_.m.syscalltick != _g_.m.p.ptr().syscalltick {
@@ -3858,14 +3911,19 @@ func exitsyscall() {
 			}
 		}
 		// There's a cpu for us, so we can run.
+		// 增加当前处理器的系统调用计时器，表示 goroutine 可以运行。
 		_g_.m.p.ptr().syscalltick++
 		// We need to cas the status and scan before resuming...
+		// 使用原子操作将 goroutine 的状态从 _Gsyscall 更改为 _Grunning，表示它可以被调度执行。
 		casgstatus(_g_, _Gsyscall, _Grunning)
 
 		// Garbage collector isn't running (since we are),
 		// so okay to clear syscallsp.
+		// 清空 syscallsp，表示不再需要保存系统调用的栈指针。
 		_g_.syscallsp = 0
+		// 减少锁计数，表示退出系统调用的处理完成。
 		_g_.m.locks--
+		// 根据是否有抢占请求，恢复 stackguard0 的值。
 		if _g_.preempt {
 			// restore the preemption request in case we've cleared it in newstack
 			_g_.stackguard0 = stackPreempt
@@ -3873,8 +3931,10 @@ func exitsyscall() {
 			// otherwise restore the real _StackGuard, we've spoiled it in entersyscall/entersyscallblock
 			_g_.stackguard0 = _g_.stack.lo + _StackGuard
 		}
+		// 将 throwsplit 设置为 false，表示不再抛出栈分裂异常。
 		_g_.throwsplit = false
 
+		// 如果用户调度被禁用且当前 goroutine 没有被调度，调用 Gosched() 进行调度。
 		if sched.disable.user && !schedEnabled(_g_) {
 			// Scheduling of this goroutine is disabled.
 			Gosched()
@@ -3897,45 +3957,74 @@ func exitsyscall() {
 		_g_.sysexitticks = cputicks()
 	}
 
+	// 减少锁计数，表示退出系统调用的处理完成。
 	_g_.m.locks--
 
+	/*
+		由于在进入系统调用前，解除了 M 和 P 的关系，因此从系统调用返回，需要调用 exitsyscallfast 重新获取 P，才能继续调度执行；
+		如果获取不到 P，则调用 mcall(exitsyscall0) 解除 M 和 G 的关系，将 G 重新放入可执行队列中，等待调度器的下一次调度。
+	*/
 	// Call the scheduler.
+	// 当前M没有拿到 P，执行不了了
+	// 调用 exitsyscall0 处理 syscall 的退出过程
 	mcall(exitsyscall0)
 
+	// 调度器返回后，表示当前 goroutine 现在可以运行。
 	// Scheduler returned, so we're allowed to run now.
 	// Delete the syscallsp information that we left for
 	// the garbage collector during the system call.
 	// Must wait until now because until gosched returns
 	// we don't know for sure that the garbage collector
 	// is not running.
+	// 清空 syscallsp，表示不再需要保存系统调用的栈指针。
 	_g_.syscallsp = 0
+	// 增加当前处理器的系统调用计时器，表示 goroutine 现在可以运行。
 	_g_.m.p.ptr().syscalltick++
+	// 将 throwsplit 设置为 false，表示不再抛出栈分裂异常。
 	_g_.throwsplit = false
 }
 
+/*
+	exitsyscallfast 函数的主要功能是尝试快速恢复 goroutine 的执行，具体步骤如下：
+
+	1. 检查调度状态：如果调度器处于冻结状态，返回 false，表示无法快速退出。
+	2. 尝试重新获取oldp处理器：如果且其状态为 _Psyscall，尝试将其状态更改为 _Pidle，并绑定处理器。
+	3. 获取空闲处理器：如果没有找到最后一个处理器，检查是否有其他空闲的处理器，并尝试获取。
+
+*/
 //go:nosplit
 func exitsyscallfast(oldp *p) bool {
 	_g_ := getg()
 
 	// Freezetheworld sets stopwait but does not retake P's.
+	// 检查调度器的状态。如果 stopwait 被设置为 freezeStopWait，则返回 false，表示无法快速退出系统调用。
 	if sched.stopwait == freezeStopWait {
 		return false
 	}
 
 	// Try to re-acquire the last P.
+	// 如果存在旧的 P 且旧 P 的状态为 _Psyscall，将其状态切换为 _Pidle
+	// 优先使用原来的 P
 	if oldp != nil && oldp.status == _Psyscall && atomic.Cas(&oldp.status, _Psyscall, _Pidle) {
 		// There's a cpu for us, so we can run.
+		// 用 wirep(oldp) 将处理器与当前 goroutine 绑定
 		wirep(oldp)
+		// 调用 exitsyscallfast_reacquired() 进行后续处理。
 		exitsyscallfast_reacquired()
+		// 返回 true，表示成功快速退出系统调用。
 		return true
 	}
 
 	// Try to get any other idle P.
+	// 如果oldp为空或者不处于系统调度状态：检查是否有其他空闲的处理器（P）。
+	// 如果 sched.pidle 不为 0，表示有空闲的处理器。
 	if sched.pidle != 0 {
 		var ok bool
 		systemstack(func() {
+			// 调用 exitsyscallfast_pidle() 尝试获取一个空闲的处理器。并绑定到M上
 			ok = exitsyscallfast_pidle()
 			if ok && trace.enabled {
+				// 二次检查oldp
 				if oldp != nil {
 					// Wait till traceGoSysBlock event is emitted.
 					// This ensures consistency of the trace (the goroutine is started after it is blocked).
@@ -3946,6 +4035,7 @@ func exitsyscallfast(oldp *p) bool {
 				traceGoSysExit(0)
 			}
 		})
+		// 如果成功获取到空闲的处理器，返回 true。
 		if ok {
 			return true
 		}
@@ -3978,6 +4068,7 @@ func exitsyscallfast_reacquired() {
 
 func exitsyscallfast_pidle() bool {
 	lock(&sched.lock)
+	// 找一个空闲的P
 	_p_ := pidleget()
 	if _p_ != nil && atomic.Load(&sched.sysmonwait) != 0 {
 		atomic.Store(&sched.sysmonwait, 0)
@@ -3985,43 +4076,65 @@ func exitsyscallfast_pidle() bool {
 	}
 	unlock(&sched.lock)
 	if _p_ != nil {
+		// 通过 wirep 将当前的 M 绑定到指定的 P，确保 M 只能在该 P 上运行。
 		acquirep(_p_)
 		return true
 	}
 	return false
 }
 
+// exitsyscall0 函数的主要目的是处理 goroutine 从系统调用返回的慢路径。当无法快速获取处理器（P）时，该函数将 goroutine 标记为可运行，并将其排入调度队列。
 // exitsyscall slow path on g0.
 // Failed to acquire P, enqueue gp as runnable.
 //
+/*
+	1. 更新 G 的状态是_Grunnable；
+	2. 调用 dropg 解除当前 G 与 M 的绑定关系；
+	3. 再次尝试获取 P，获取到 P，则调用 acquirep 绑定 P 和 M，然后调用 execute 进入调度循环；未获取到 P，则调用 globrunqput 将 G 放入 sched.runq 全局运行队列；
+	4. 如果M上有锁定的G，只能调用 stoplockedm -> mPark ，让 M 睡眠在 m.park 上，直到锁定的G可运行；
+	5. 调用 stopm 将 M 加入全局的空闲 M 列表，然后将 M 睡眠在 m.park 上，等待被唤醒
+	6. M 被唤醒后，代表获取到了可用的 P， 随后会调用 schedule 函数，执行一次新的调度，重新开始工作。
+*/
 //go:nowritebarrierrec
 func exitsyscall0(gp *g) {
 	_g_ := getg()
 
+	// 使用 casgstatus 将 goroutine gp 的状态从 _Gsyscall 更改为 _Grunnable，表示它可以被调度执行。
 	casgstatus(gp, _Gsyscall, _Grunnable)
+	// 解除当前操作系统线程（M）与当前正在运行的 Goroutine（G）之间的关联。
 	dropg()
 	lock(&sched.lock)
 	var _p_ *p
+	// 判断 _g_ 是否可调度
 	if schedEnabled(_g_) {
+		// 如果可调度，调用 pidleget() 再次尝试获取一个空闲的处理器。
 		_p_ = pidleget()
 	}
+	// 如果还是没有获取到空闲的处理器，将 goroutine gp 放入全局运行队列 globrunqput(gp)。
 	if _p_ == nil {
 		globrunqput(gp)
 	} else if atomic.Load(&sched.sysmonwait) != 0 {
+		// 如果系统监控等待标志 sched.sysmonwait 不为 0，表示系统监控正在等待，重置该标志并唤醒监控线程。
 		atomic.Store(&sched.sysmonwait, 0)
 		notewakeup(&sched.sysmonnote)
 	}
 	unlock(&sched.lock)
+	// 如果成功获取到处理器 _p_，调用 acquirep(_p_) 将当前的 M 绑定到该 P，并执行 goroutine gp。
+	// execute(gp, false) 是一个不会返回的调用，表示 goroutine 将开始执行。
 	if _p_ != nil {
 		acquirep(_p_)
 		execute(gp, false) // Never returns.
 	}
+	// 如果当前 M 被锁定（_g_.m.lockedg 不为 0），调用 stoplockedm() 等待其他线程调度 gp，然后再次执行 gp。
 	if _g_.m.lockedg != 0 {
-		// Wait until another thread schedules gp and so m again.
+		// 当一个 M（Machine）被锁定到一个 G（Goroutine）时，停止该 M 的执行，直到该 G 再次变为可运行状态。
 		stoplockedm()
+		// M唤醒以后说明，有 p 绑定 m，直接运行 gp 即可
 		execute(gp, false) // Never returns.
 	}
+	// 当前工作线程进入睡眠，等待被其它线程唤醒 mPark()
 	stopm()
+	// 从睡眠中被其它线程唤醒，执行 schedule 调度循环重新开始工作
 	schedule() // Never returns.
 }
 
@@ -5130,9 +5243,18 @@ func procresize(nprocs int32) *p {
 // This function is allowed to have write barriers even if the caller
 // isn't because it immediately acquires _p_.
 //
+/*
+	acquirep 函数的主要功能是将当前的 M 绑定到指定的 P，并在此过程中处理与内存管理和追踪相关的任务。以下是该函数的关键点：
+
+	1. 绑定处理器：通过 wirep 将当前的 M 绑定到指定的 P，确保 M 只能在该 P 上运行。
+	2. 允许写屏障：在成功绑定 P 后，允许使用写屏障，以便在后续操作中进行内存管理。
+	3. 刷新 mcache：在 P 可以进行内存分配之前，执行 mcache 刷新，以确保分配的有效性。
+	4. 追踪支持：在追踪启用的情况下，记录处理器的启动事件，以便进行性能分析。
+*/
 //go:yeswritebarrierrec
 func acquirep(_p_ *p) {
 	// Do the part that isn't allowed to have write barriers.
+	// 通过 wirep 将当前的 M 绑定到指定的 P，确保 M 只能在该 P 上运行。
 	wirep(_p_)
 
 	// Have p; write barriers now allowed.
@@ -5801,6 +5923,11 @@ func schedEnableUser(enable bool) {
 	}
 }
 
+/*
+	schedEnabled 函数的主要目的是确定给定的 goroutine（gp）是否可以被调度。它根据调度器的状态和 goroutine 的类型来做出判断。
+	1. 如果 gp 是系统 goroutine，返回 true，表示可以调度。
+	2. 如果用户级调度未被禁用，直接返回 true，表示可以调度。
+*/
 // schedEnabled reports whether gp should be scheduled. It returns
 // false is scheduling of gp is disabled.
 func schedEnabled(gp *g) bool {
