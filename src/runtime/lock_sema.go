@@ -144,9 +144,8 @@ func notewakeup(n *note) {
 	var v uintptr
 	for {
 		v = atomic.Loaduintptr(&n.key)
-		// 使用原子比较并交换操作 atomic.Casuintptr 尝试将 n.key 从 v 设置为 locked。
-		// 是为了使被唤醒的线程，可以通过查看该值是否等于1，来确定是被其它线程唤醒，还是意外从睡眠中苏醒了过来。
-		// 如果该值为 1 则表示是被唤醒的，可以继续工作了，但如果该值为 0，则表示是意外苏醒，需要抛出异常。
+		// 使用原子比较并交换操作 atomic.Casuintptr 尝试将 n.key 从 v 设置为 locked。locked != 0。
+		// notesleep 函数是通过判断 n.key == 0 来继续休眠M的，当n.key ！= 0，notesleep 函数则会跳出休眠的循环。
 		if atomic.Casuintptr(&n.key, v, locked) {
 			break
 		}
@@ -166,17 +165,24 @@ func notewakeup(n *note) {
 	default:
 		// Must be the waiting m. Wake it up.
 		// 否则，v 必须是等待的 M，将其转换为 *m 类型并调用 semawakeup 函数唤醒它。
-		// semawakeup 函数用于唤醒等待的 M。具体实现依赖于操作系统的信号量机制.
+		// semawakeup 函数用于唤醒等待的 M。具体实现依赖于操作系统的信号量机制。即给M发信号唤醒它。
 		semawakeup((*m)(unsafe.Pointer(v)))
 	}
 }
 
+// notesleep 函数的主要功能是使当前 M 进入休眠状态，直到被唤醒。
+// 它使用了 Go 运行时的信号量和原子操作来管理休眠和唤醒的机制。
+// 这里找源码需要注意一下: 想看 linux 源码的，就得跳转到 src/runtime/lock_futex.go 139
 func notesleep(n *note) {
+	// 函数的参数 n 是一个指向 note 结构的指针，表示当前 goroutine 的休眠状态。
 	gp := getg()
+	// notesleep 只能在 G0 上调用，以确保安全性。
 	if gp != gp.m.g0 {
 		throw("notesleep not on g0")
 	}
+	// 调用相关的C函数，创建一个信号量，用于管理当前 M 的休眠状态。
 	semacreate(gp.m)
+	// 使用 atomic.Casuintptr 原子地将 n.key 的值从 0 更改为当前 M 的指针。如果成功，表示当前 M 已经被排队等待休眠。
 	if !atomic.Casuintptr(&n.key, 0, uintptr(unsafe.Pointer(gp.m))) {
 		// Must be locked (got wakeup).
 		if n.key != locked {
@@ -185,17 +191,26 @@ func notesleep(n *note) {
 		return
 	}
 	// Queued. Sleep.
+	// 设置 gp.m.blocked = true，表示当前 M 正在被阻塞。
 	gp.m.blocked = true
 	if *cgo_yield == nil {
+		// 调用 semasleep(-1) 使当前 M 进入无限期休眠，直到被唤醒。
 		semasleep(-1)
 	} else {
 		// Sleep for an arbitrary-but-moderate interval to poll libc interceptors.
+		// 进入一个循环，定期调用 semasleep(ns) 进行短暂休眠（ns 为 10 微秒），并在每次循环中调用 asmcgocall(*cgo_yield, nil)，以便在休眠期间轮询 Cgo 拦截器。
+		// 直到 n.key 被notewakeup函数更改，atomic.Loaduintptr(&n.key)将不为0
 		const ns = 10e6
 		for atomic.Loaduintptr(&n.key) == 0 {
 			semasleep(ns)
+			// 切换的系统栈，并执行cgo_yield函数
+			// cgo_yield函数的作用是，在休眠期间轮询 Cgo 拦截器
+			// 这是为了确保在与 C 代码交互时，Go 运行时能够保持响应性，避免在 C 代码中长时间阻塞。
 			asmcgocall(*cgo_yield, nil)
 		}
 	}
+	// 在 M 被唤醒后，gp.m.blocked 被设置为 false，表示当前 M 不再被阻塞。
+	// 这是一个重要的步骤，因为它允许调度器知道当前 M 可以再次参与调度。
 	gp.m.blocked = false
 }
 

@@ -24,9 +24,11 @@ func semacreate(mp *m) {
 		return
 	}
 	mp.initialized = true
+	// 初始化M的信号相关的分布式锁
 	if err := pthread_mutex_init(&mp.mutex, nil); err != 0 {
 		throw("pthread_mutex_init")
 	}
+	// 初始化M的信号量cond，用于接受唤醒信号
 	if err := pthread_cond_init(&mp.cond, nil); err != 0 {
 		throw("pthread_cond_init")
 	}

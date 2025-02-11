@@ -549,14 +549,15 @@ type m struct {
 	// 暂存的处理器
 	nextp puintptr
 	// 执行系统调用之前的使用线程的处理器
-	oldp          puintptr // the p that was attached before executing a syscall
-	id            int64
-	mallocing     int32
-	throwing      int32
-	preemptoff    string // if != "", keep curg running on this m
-	locks         int32
-	dying         int32
-	profilehz     int32
+	oldp       puintptr // the p that was attached before executing a syscall
+	id         int64
+	mallocing  int32
+	throwing   int32
+	preemptoff string // if != "", keep curg running on this m
+	locks      int32
+	dying      int32
+	profilehz  int32
+	// 自旋计数 sched.nmspinning 是一个用于跟踪当前处于自旋状态的 M（工作线程）数量的变量。
 	spinning      bool // m is out of work and is actively looking for work
 	blocked       bool // m is blocked on a note
 	newSigstack   bool // minit on C thread called sigaltstack
@@ -831,8 +832,9 @@ type schedt struct {
 	// m.exited is set. Linked through m.freelink.
 	freem *m
 
-	gcwaiting  uint32 // gc is waiting to run // GC调度器是否处于等待状态
-	stopwait   int32
+	// sched.gcwaiting 是一个标志，用于表示当前是否有垃圾回收（GC）的“stop-the-world”（STW）事件正在等待发生或正在进行中。
+	gcwaiting  uint32 // gc is waiting to run
+	stopwait   int32  // 等待GC的线程数量
 	stopnote   note
 	sysmonwait uint32 // GC系统监控是否处于等待状态
 	sysmonnote note
