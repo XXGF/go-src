@@ -29,12 +29,12 @@ const (
 // ../reflect/type.go:/^type.rtype.
 // ../internal/reflectlite/type.go:/^type.rtype.
 type _type struct {
-	size       uintptr
-	ptrdata    uintptr // size of memory prefix holding all pointers
-	hash       uint32
-	tflag      tflag
-	align      uint8
-	fieldAlign uint8
+	size       uintptr // 类型占用的内存大小
+	ptrdata    uintptr // size of memory prefix holding all pointers // 包含指针的内存前缀大小
+	hash       uint32  // 类型哈希值
+	tflag      tflag   // 类型标志
+	align      uint8   // 类型的对齐系数（如 int64 为 8）
+	fieldAlign uint8   // 结构体字段的对齐系数
 	kind       uint8
 	// function for comparing objects of this type
 	// (ptr to object A, ptr to object B) -> ==?

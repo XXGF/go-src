@@ -115,19 +115,46 @@ func isEmpty(x uint8) bool {
 type hmap struct {
 	// Note: the format of the hmap is also encoded in cmd/compile/internal/gc/reflect.go.
 	// Make sure this stays in sync with the compiler's definition.
-	count     int // # live cells == size of map.  Must be first (used by len() builtin)
-	flags     uint8
-	B         uint8  // log_2 of # of buckets (can hold up to loadFactor * 2^B items)
+	count int // # live cells == size of map.  Must be first (used by len() builtin)
+	// 状态标志（迭代、写入等）
+	flags uint8
+	// 桶数量的对数（实际桶数 = 2^B）
+	B uint8 // log_2 of # of buckets (can hold up to loadFactor * 2^B items)
+	// 溢出桶的近似数量
 	noverflow uint16 // approximate number of overflow buckets; see incrnoverflow for details
-	hash0     uint32 // hash seed
+	// 哈希种子
+	hash0 uint32 // hash seed
 
-	buckets    unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
+	// 当前桶数组指针，桶中的元素是：type bmap struct
+	buckets unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
+	// 扩容时的旧桶数组指针
 	oldbuckets unsafe.Pointer // previous bucket array of half the size, non-nil only when growing
-	nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
-
+	// 迁移进度计数器
+	nevacuate uintptr // progress counter for evacuation (buckets less than this have been evacuated)
+	// 可选字段（溢出桶、额外信息）
 	extra *mapextra // optional fields
 }
 
+/*
+	mapextra 是 Go 语言哈希表（hmap）的扩展元数据，用于处理某些特定场景下的内存管理和优化。
+
+	并非所有 map 都会用到该结构体，仅在以下条件满足时才会分配：
+		1. 键（key）和值（elem）均不包含指针（如 map[int]int）。
+		2. 键和值均为内联类型（非接口或复杂类型，如 map[int]int）。
+
+	为什么这么设计？
+	1. 减少 GC 扫描开销：
+		若键值无指针，桶内存无需 GC 扫描，大幅减少扫描范围。
+		溢出桶指针通过 mapextra 集中管理，避免 GC 遗漏。
+
+	2. 内存分配优化：
+		预分配溢出桶通过 nextOverflow 缓存，减少运行时内存分配次数。
+		溢出桶复用降低内存碎片。
+
+	3. 内存布局紧凑：
+		键值分离存储（先存所有键，再存所有值）避免因类型对齐导致的填充，节省内存。
+		（例如 map[int64]int8 的键值对无额外填充）
+*/
 // mapextra holds fields that are not present on all maps.
 type mapextra struct {
 	// If both key and elem do not contain pointers and are inline, then we mark bucket
@@ -138,18 +165,59 @@ type mapextra struct {
 	// overflow contains overflow buckets for hmap.buckets.
 	// oldoverflow contains overflow buckets for hmap.oldbuckets.
 	// The indirection allows to store a pointer to the slice in hiter.
-	overflow    *[]*bmap
+	// 当前桶数组的溢出桶列表
+	overflow *[]*bmap
+	// 扩容时旧桶数组的溢出桶列表
 	oldoverflow *[]*bmap
 
 	// nextOverflow holds a pointer to a free overflow bucket.
+	// 预分配的空闲溢出桶链表头
+	/*
+		内存预分配：Go 在初始化 map 的桶数组时，会预分配一些溢出桶，形成单向链表。
+		减少分配次数：当需要新溢出桶时，直接从 nextOverflow 链表中获取，避免频繁调用内存分配器。
+	*/
 	nextOverflow *bmap
 }
 
+/*
+这只是表面(src/runtime/hashmap.go)的结构，编译期间会给它加料，动态地创建一个新的结构：
+type bmap struct {
+    tophash  [8]uint8
+
+	// 这里key和value是分开存储到两个数组中的。
+	// 这样的设计使得内存布局更加紧凑，减少了内存对齐和填充的开销。
+	// 这在某些情况下（例如，存储不同类型的键和值: map[int64]int16）可以显著提高内存使用效率。
+	// 性能: 通过将键和元素紧密存储，Go 的 map 实现可以提高缓存的局部性，从而提高访问速度。
+	keys     [8]keytype
+    values   [8]valuetype
+
+	pad      uintptr
+	// 处理哈希冲突：
+	// 当一个桶中的键值对数量超过了桶的容量时，新的键值对将被存储在溢出桶中。
+ 	// 溢出桶是一个链表结构，指向其他 bmap 结构体，以便存储更多的键值对。
+	// 使用溢出指针来处理哈希冲突，使得 Go 的 map 能够在高负载情况下仍然保持良好的性能。
+    overflow uintptr
+}
+Note:
+当 map 的 key 和 value 都不是指针，并且 size 都小于 128 字节的情况下，会把 bmap 标记为不含指针，这样可以避免 gc 时扫描整个 hmap。
+但是，我们看 bmap 其实有一个 overflow 的字段，是指针类型的，破坏了 bmap 不含指针的设想，这时会把 overflow 移动到 extra 字段来。
+*/
+/*
+	每个 bucket 设计成最多只能放 8 个 key-value 对，
+	如果有第 9 个 key-value 落入当前的 bucket，那就需要再构建一个 bucket ，通过 overflow 指针连接起来。
+*/
 // A bucket for a Go map.
 type bmap struct {
+	/*
+		当一个 槽 的 tophash 值小于 minTopHash 时，标志这个 槽 的迁移状态。
+	*/
 	// tophash generally contains the top byte of the hash value
 	// for each key in this bucket. If tophash[0] < minTopHash,
 	// tophash[0] is a bucket evacuation state instead.
+
+	// tophash 数组存储每个键的哈希值的最高字节。这个字节通常用于快速比较哈希值，以确定键是否可能匹配。
+	// 为什么这里说的是可能，因为即使哈希值对上了，还有比较key，才能完全确定。
+	// bucketCnt == 8
 	tophash [bucketCnt]uint8
 	// Followed by bucketCnt keys and then bucketCnt elems.
 	// NOTE: packing all the keys together and then all the elems together makes the
@@ -1186,9 +1254,9 @@ func bucketEvacuated(t *maptype, h *hmap, bucket uintptr) bool {
 // evacDst is an evacuation destination.
 type evacDst struct {
 	// 表示bucket 移动的目标地址
-	b *bmap          // current destination bucket
+	b *bmap // current destination bucket
 	// 指向 x,y 中 key/val 的 index
-	i int            // key/elem index into b
+	i int // key/elem index into b
 	// 指向 x，y 中的 key
 	k unsafe.Pointer // pointer to current key storage
 	// 指向 x，y 中的 value
