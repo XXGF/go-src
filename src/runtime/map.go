@@ -492,6 +492,23 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 }
 
 /*
+	看个实例：
+	func main() {
+		m := map[int64]string
+		m[1] = "a"
+
+		// 使用m[1]访问其中的一个key，是如何调用到相应的源码的？
+		fmt.Println(m[1])
+	}
+
+	在 Go 语言中，当你通过 m[1] 访问一个 map[int64]string 类型的 map 时，底层会通过编译器和运行时协作，最终调用到 mapaccess1 等运行时函数。
+	也就是说，是在编译阶段，编译器将 m[1] 转为对 mapaccess1 函数的调用：
+	// 伪代码：实际由编译器生成
+	valPtr := mapaccess1(maptype_of_m, &m, unsafe.Pointer(&key))
+	val := *(*string)(valPtr) // 将指针解引用为 string 类型
+*/
+
+/*
 	这个函数是用来从map中获取某个键对应的值的指针，即使键不存在，也会返回零值的指针。（如 int 返回 0 的地址）
 	mapaccess1 通过多级哈希定位、高效内存布局和并发安全机制，实现了 Go map 的高性能查找。
 	其设计充分权衡了速度、内存与并发安全性，是 Go 运行时高效数据结构的典型代表。
@@ -739,11 +756,27 @@ func mapaccess2_fat(t *maptype, h *hmap, key, zero unsafe.Pointer) (unsafe.Point
 	return e, true
 }
 
+/*
+	关键设计思想
+		延迟初始化：若 h.buckets 为空，首次插入数据时，才分配初始 Bucket 数组（默认大小为 1 << B）。
+		惰性扩容：仅在插入时检查负载因子，逐步迁移数据，平衡性能与内存。
+		写时复制：通过 oldbuckets 保留旧数据，保证扩容期间读操作不受影响。
+		内存局部性：Bucket 内键值紧凑存储，利用 CPU 缓存行提升访问速度。
+		间接存储优化：对大对象存储指针，减少 Bucket 内存占用及复制开销。
+		并发安全：通过 flags 标志位实现轻量级写锁，避免全局锁竞争。
+
+	性能影响
+		哈希冲突：链表法处理冲突，最坏情况下退化为 O(n)，但良好的哈希分布可保持 O(1)。
+		内存重用：溢出桶通过预分配和复用减少 GC 压力。
+		扩容代价：分摊到每次写入操作，避免一次性大延迟。
+*/
 // Like mapaccess, but allocates a slot for the key if it is not present in the map.
 // map赋值，第一阶段：校验和初始化
 func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	// 判断 hmap 是否已经初始化（是否为 nil）
 	if h == nil {
+		// 未初始化的map，通过m[key]获取不会报错，会返回零值
+		// 未初始化的map，通过m[key]=val赋值，会panic
 		panic(plainError("assignment to entry in nil map"))
 	}
 	if raceenabled {
@@ -759,7 +792,7 @@ func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	if h.flags&hashWriting != 0 {
 		throw("concurrent map writes")
 	}
-	//根据 key 的不同类型调用不同的 hash 方法计算得出 hash 值
+	// 根据 key 的不同类型调用不同的 hash 方法计算得出 hash 值
 	hash := t.hasher(key, uintptr(h.hash0))
 
 	// Set hashWriting after calling t.hasher, since t.hasher may panic,
@@ -767,6 +800,7 @@ func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	// 设置 flags 标志位，表示有一个 goroutine 正在写入数据。因为 alg.hash 有可能出现 panic 导致异常
 	h.flags ^= hashWriting
 
+	// 延迟初始化:
 	// 判断 buckets 是否为 nil，若是则调用 newobject 根据当前 bucket 大小进行分配
 	// 初始化时没有初始 buckets，那么它在第一次赋值时就会对 buckets 分配
 	if h.buckets == nil {
@@ -774,6 +808,10 @@ func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	}
 
 again:
+	/*
+		渐进式扩容：在写入时触发部分数据迁移（每次迁移 1-2 个 Bucket），避免一次性迁移的延迟峰值。
+		重试机制：迁移后 Bucket 布局变化，需重新计算索引。
+	*/
 	// 根据低八位计算得到 bucket 的内存地址
 	bucket := hash & bucketMask(h.B)
 	// 判断是否正在扩容，若正在扩容中则先迁移再接着处理
@@ -785,9 +823,9 @@ again:
 	// 计算 key hash 高八位用于查找 Key
 	top := tophash(hash)
 
-	var inserti *uint8
-	var insertk unsafe.Pointer
-	var elem unsafe.Pointer
+	var inserti *uint8         // 存高8位哈希值
+	var insertk unsafe.Pointer // 存 key 的内存地址
+	var elem unsafe.Pointer    // 存 value 的内存地址
 bucketloop:
 	for {
 		// 迭代 bmap 中的每一个 位置（共 8 个）
@@ -812,6 +850,7 @@ bucketloop:
 			if t.indirectkey() {
 				k = *((*unsafe.Pointer)(k))
 			}
+			// 键相等性判断：使用类型特定的 equal 函数进行深度比较。
 			if !t.key.equal(key, k) {
 				continue
 			}
@@ -835,9 +874,9 @@ bucketloop:
 	// If we hit the max load factor or we have too many overflow buckets,
 	// and we're not already in the middle of growing, start growing.
 	// 若同时满足三个条件：
-	// 1. 触发最大 LoadFactor 、
-	// 2. 存在过多溢出桶 overflow buckets、【溢出桶的数量大于正常桶的数量或溢出桶的数量大于 2^15】
-	// 3. 没有正在进行扩容。
+	// 1. 没有正在进行扩容。
+	// 2. 触发最大 LoadFactor 、
+	// 3. 存在过多溢出桶 overflow buckets、【溢出桶的数量大于正常桶的数量或溢出桶的数量大于 2^15】
 	// 就会进行扩容
 	if !h.growing() && (overLoadFactor(h.count+1, h.B) || tooManyOverflowBuckets(h.noverflow, h.B)) {
 		hashGrow(t, h)
@@ -855,6 +894,7 @@ bucketloop:
 	}
 
 	// store new key/elem at insert position
+	// 间接存储处理：键或值为指针类型时，额外分配堆内存并存储指针。
 	// 存储 插入的kv以及hash值
 	if t.indirectkey() {
 		kmem := newobject(t.key)
