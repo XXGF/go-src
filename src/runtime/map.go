@@ -248,19 +248,49 @@ type hiter struct {
 }
 
 // bucketShift returns 1<<b, optimized for code generation.
+// bucketShift 函数用于安全高效地计算 2 的 b 次方（即 1 << b），通过掩码操作确保位移量在系统位数范围内，避免溢出。
 func bucketShift(b uint8) uintptr {
 	// Masking the shift amount allows overflow checks to be elided.
+	/*
+		掩码值：sys.PtrSize*8 - 1
+			32 位系统：4*8 -1 = 31 → 二进制 0b11111（5 位掩码）。
+			64 位系统：8*8 -1 = 63 → 二进制 0b111111（6 位掩码）。
+		作用：将 b 的大小限制在 [0, 31]（32 位）或 [0, 63]（64 位）范围内，避免位移量超出系统位数导致的未定义行为。
+
+		设计意义
+			(1) 安全性
+				防止溢出：通过掩码确保位移量不超过系统位数，避免因 b 过大导致结果不可控。
+				防御性编程：即使 b 错误传入超大值（如 b = 255），结果仍为有效位移量。
+			(2) 性能优化
+				省略溢出检查：掩码操作替代显式的条件判断（如 if b >= 64），减少分支预测开销。
+				编译优化友好：位运算直接映射到硬件指令，提升代码生成效率。
+			(3) 应用场景
+				哈希表桶数计算：Go map 的桶数始终为 2 的幂次（2^B），通过 bucketShift(B) 快速计算桶数。
+				内存对齐：确保桶数组大小适配系统位数，提升内存访问效率。
+
+		uintptr(1) << (b & (sys.PtrSize*8 - 1)): 将1左移b位。
+		假设b=5: 1左移5位=2^5=32
+	*/
 	return uintptr(1) << (b & (sys.PtrSize*8 - 1))
 }
 
 // bucketMask returns 1<<b - 1, optimized for code generation.
 func bucketMask(b uint8) uintptr {
+	// 假设b=5，则bucketShift(b)=32
+	// 这里-1，是为了得到5位的掩码：2^5=32=100000，32-1=100000-1=11111 得到5位的掩码。
+	// 掩码的作用是：为了去hash的低5位，用于定位桶数组的索引。即找到哪个桶。
 	return bucketShift(b) - 1
 }
 
 // tophash calculates the tophash value for hash.
 func tophash(hash uintptr) uint8 {
+	// 提取哈希值高 8 位:
+	// 		64 位系统：sys.PtrSize*8 = 64 → 右移 56 位 → 提取哈希值最高 8 位。
+	// 		目的：用哈希值的最高 8 位作为快速筛选的标记（tophash），减少键比较次数。
 	top := uint8(hash >> (sys.PtrSize*8 - 8))
+	// 规避特殊标记:
+	// 		原因：map 桶的 tophash 需要与以下特殊状态区分：0->4
+	//		调整后：确保 tophash ∈ [5, 255]，避免与特殊标记冲突。
 	if top < minTopHash {
 		top += minTopHash
 	}
@@ -461,71 +491,118 @@ func makeBucketArray(t *maptype, b uint8, dirtyalloc unsafe.Pointer) (buckets un
 	return buckets, nextOverflow
 }
 
+/*
+	这个函数是用来从map中获取某个键对应的值的指针，即使键不存在，也会返回零值的指针。（如 int 返回 0 的地址）
+	mapaccess1 通过多级哈希定位、高效内存布局和并发安全机制，实现了 Go map 的高性能查找。
+	其设计充分权衡了速度、内存与并发安全性，是 Go 运行时高效数据结构的典型代表。
+
+	关键设计点
+		哈希分片与掩码：通过哈希低位确定 Bucket，保证数据均匀分布。
+		TopHash 快速过滤：减少全键比较次数，提升查找效率。
+		扩容透明处理：在扩容期间同时查找新旧 Bucket，确保数据迁移不影响读操作。
+		内存布局优化：紧凑存储键值对，利用 CPU 缓存行提升访问速度。
+		并发安全机制：通过 flags 标志位检测并发写操作，快速失败避免数据竞争。
+		零值返回策略：避免返回 nil，简化调用方错误处理，但需注意潜在 GC 影响。
+
+	性能优化
+		位运算替代除法：Bucket 索引计算使用位掩码而非取模运算。
+		提前终止搜索：emptyRest 标记减少不必要的槽位检查。
+		间接存储节省空间：对大对象存储指针而非值，减少 Bucket 内存占用。
+
+*/
 // mapaccess1 returns a pointer to h[key].  Never returns nil, instead
 // it will return a reference to the zero object for the elem type if
 // the key is not in the map.
 // NOTE: The returned pointer may keep the whole map live, so don't
 // hold onto it for very long.
 func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
+	// 竞态检测（Race Detector）：
+	// 若启用竞态检测（-race），记录当前 map 的读操作，用于检测并发读写冲突。
 	if raceenabled && h != nil {
 		callerpc := getcallerpc()
 		pc := funcPC(mapaccess1)
 		racereadpc(unsafe.Pointer(h), callerpc, pc)
 		raceReadObjectPC(t.key, key, callerpc, pc)
 	}
+	// 内存检查（Memory Sanitizer）：
+	// 若启用内存检查（-msan），验证 key 的内存区域是否合法。
 	if msanenabled && h != nil {
 		msanread(key, t.key.size)
 	}
+	// 空 map 直接返回零值:
+	// 即即使一个map没有初始化，通过 map[key] 访问也不会panic，只会返回零值。
 	if h == nil || h.count == 0 {
+		// 哈希函数可能 panic：某些键类型（如函数、接口）的哈希函数可能 panic，需在此处提前触发。
 		if t.hashMightPanic() {
 			t.hasher(key, 0) // see issue 23734
 		}
 		return unsafe.Pointer(&zeroVal[0])
 	}
+	// 检测并发写操作：
+	// 若发现其他协程正在写入 map（h.flags 包含 hashWriting 标志），直接抛出异常。
+	// Go map 非线程安全：这是 Go 防止并发读写导致内存损坏的关键机制。
 	if h.flags&hashWriting != 0 {
 		throw("concurrent map read and map write")
 	}
+	// 哈希函数调用：
+	// 使用类型特定的哈希函数 t.hasher，结合 map 的随机种子 h.hash0，计算键的哈希值。
+	// 哈希随机化：h.hash0 在 map 创建时生成，防止哈希碰撞攻击。
 	hash := t.hasher(key, uintptr(h.hash0))
-	// 比如 B=5，那 m 就是31，二进制是全 1
+	// 比如 B=5，那 m 就是31。桶的数量 = m+1 = 32个桶
 	m := bucketMask(h.B)
-	// 1. (hash&m):	求 bucket num 时，将 hash 与 m 相与，达到 bucket num 由 hash 的低 B 位决定的效果
+	// 1. (hash&m):	这里的目的是：将hash和桶数据做取余运算：hash%桶数量，来找到hash对应的桶。
+	//    但是取余运算性能太低，所以改成位运算。
+	//    位运算取余的原理：当模数 m 是 2 的幂次方（如 32 = 2^5）时，取余运算 n % m 等价于保留 n 的二进制低 log2(m) 【log2(32) = 5】 位。
+	//	  举个例子：n % 32 == n & (32 - 1)  // 即 n & 31
 	// 2. uintptr(t.bucketsize): 这里只是单纯将 t.bucketsize 属性的值转为 unitptr类型，值本身是没有变的
-	// 3. (add(h.buckets, (hash&m)*uintptr(t.bucketsize))): 这里定位到 第 (hash&m) 个bucket的指针地址
-	// 4. b 就是 bucket 的地址
+	// 3. (add(h.buckets, (hash&m)*uintptr(t.bucketsize))): h.buckets 是桶数组的起始地址，通过ji's偏移量 (hash&m)*uintptr(t.bucketsize) 找到目标桶 b。
+	// 4. 所以，b是目标桶，或者说是目标桶的地址。
 	b := (*bmap)(add(h.buckets, (hash&m)*uintptr(t.bucketsize)))
 	// oldbuckets 不为 nil，说明发生了扩容
 	if c := h.oldbuckets; c != nil {
+		// 如果不是等量扩容，旧桶数量是当前的一半
+		/*
+			扩容行为
+				普通扩容（非同尺寸）：
+					创建两倍于当前 bucket 数量的新 bucket 数组（h.B++）。
+					数据迁移到新 buckets，分散键值对以减少冲突。
+				同尺寸扩容：
+					保持 bucket 数量不变（h.B 不变）。
+					重新整理现有数据，减少溢出链长度，提升访问效率。
+		*/
 		if !h.sameSizeGrow() {
 			// There used to be half as many buckets; mask down one more power of two.
 			m >>= 1
 		}
-		// 求出 key 在老的 map 中的 bucket 位置
+		// 重新计算：求出 key 在老的 map 中的 bucket 位置
 		oldb := (*bmap)(add(c, (hash&m)*uintptr(t.bucketsize)))
-		// 如果 oldb 没有搬迁到新的 bucket
-		// 那就在老的 bucket 中寻找
+		//若旧桶未迁移，继续在旧桶中查找 那就在老的 bucket 中寻找
 		if !evacuated(oldb) {
 			b = oldb
 		}
 	}
-	// 计算出高 8 位的 hash，相当于右移 56 位，只取高8位
+	// 计算出高 8 位的 hash：即右移 56 位，剩下原来的高8位
+	// tophash 用于快速跳过不匹配的键，减少全键比较次数。
 	top := tophash(hash)
 bucketloop:
 	// 开始寻找key
 	// 刚开始的时候 bmap肯定不为nil，遍历完当前bmap的8个位置，开始遍历 overflow
 	for ; b != nil; b = b.overflow(t) {
-		// 遍历 8 个 bucket
+		// 内层循环：遍历 Bucket 内 8 个槽位
 		for i := uintptr(0); i < bucketCnt; i++ {
 			if b.tophash[i] != top {
+				// 后续槽位均为空，提前终止
 				if b.tophash[i] == emptyRest {
 					break bucketloop
 				}
 				continue
 			}
 			// tophash 匹配，定位到 key 的位置
+			// b 是目标桶的地址，通过位移计算，得出目标key的地址：k
 			k := add(unsafe.Pointer(b), dataOffset+i*uintptr(t.keysize))
 			// key 是指针
 			if t.indirectkey() {
-				// 解引用
+				// 解引用，即取key的值
 				k = *((*unsafe.Pointer)(k))
 			}
 			// 如果 key 相等。使用hash的前8位表示一个kv，是有冲突的可能的，所以找到tophash之后，还需要比较key是否相同
@@ -540,6 +617,7 @@ bucketloop:
 			}
 		}
 	}
+	// 键不存在处理：遍历所有可能位置未找到匹配键时，返回全局零值指针。
 	return unsafe.Pointer(&zeroVal[0])
 }
 
