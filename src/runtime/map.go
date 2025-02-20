@@ -1253,6 +1253,13 @@ func mapclear(t *maptype, h *hmap) {
 	h.flags &^= hashWriting
 }
 
+/*
+	1. 触发翻倍扩容（2 倍扩容）
+		当 元素数量超过负载因子阈值 时触发，目的是减少哈希冲突，提升查询效率。
+
+	2. 触发等量扩容（整理扩容）
+		当 overflow bucket 过多，但元素数量未超负载因子 时触发，目的是整理内存碎片，优化空间利用率。
+*/
 func hashGrow(t *maptype, h *hmap) {
 	// If we've hit the load factor, get bigger.
 	// Otherwise, there are too many overflow buckets,
@@ -1307,9 +1314,30 @@ func hashGrow(t *maptype, h *hmap) {
 	// by growWork() and evacuate().
 }
 
+/*
+	loadFactor := count / (2^B)
+	count 就是 map 的元素个数，2^B 表示 bucket 数量。
+
+	我们知道，每个 bucket 有 8 个空位，在没有溢出，且所有的桶都装满了的情况下，装载因子算出来的结果是 8。
+	因此当装载因子超过 6.5 时，表明很多 bucket 都快要装满了，查找效率和插入效率都变低了。在这个时候进行扩容是有必要的。
+*/
 // overLoadFactor reports whether count items placed in 1<<B buckets is over loadFactor.
 func overLoadFactor(count int, B uint8) bool {
+	// count：当前 map 中的键值对数量。
+	// B：map 的 bucket 数组长度的对数，桶数量=2^B=(bucketShift(B)。
+	// bucketCnt：每个 bucket 可容纳的键值对数量（固定为 8）。
+	// loadFactorNum：负载因子分子（值为 13）。
+	// loadFactorDen：负载因子分母（值为 2）。
+	// 负载因子阈值：13/2 = 6.5。
 	return count > bucketCnt && uintptr(count) > loadFactorNum*(bucketShift(B)/loadFactorDen)
+	/*
+		uintptr(count) > loadFactorNum*(bucketShift(B)/loadFactorDen)
+		== uintptr(count) > (bucketShift(B)*loadFactorNum/loadFactorDen)
+		== uintptr(count)/(bucketShift(B) > loadFactorNum/loadFactorDen)
+		== map中键值对数量 / 桶数量 > 负载因子阈值：6.5
+
+		估计是因为乘法运算比除法运算的效率高，所以才写成这样
+	*/
 }
 
 // tooManyOverflowBuckets reports whether noverflow buckets is too many for a map with 1<<B buckets.
