@@ -479,6 +479,10 @@ func goschedguarded() {
 	mcall(goschedguarded_m)
 }
 
+/*
+	将当前 goroutine 置于等待状态，释放关联的锁，并触发调度器切换执行其他 goroutine。
+	典型场景：channel 阻塞操作、锁竞争、定时器等待、I/O 阻塞等。
+*/
 // Puts the current goroutine into a waiting state and calls unlockf.
 // If unlockf returns false, the goroutine is resumed.
 // unlockf must not access this G's stack, as it may be moved between
@@ -491,8 +495,11 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason w
 	if reason != waitReasonSleep {
 		checkTimeouts() // timeouts may expire while two goroutines keep the scheduler busy
 	}
+	// 获取当前m
 	mp := acquirem()
+	// 获取当前g
 	gp := mp.curg
+	// 校验g的状态
 	status := readgstatus(gp)
 	if status != _Grunning && status != _Gscanrunning {
 		throw("gopark: bad g status")
@@ -502,8 +509,10 @@ func gopark(unlockf func(*g, unsafe.Pointer) bool, lock unsafe.Pointer, reason w
 	gp.waitreason = reason
 	mp.waittraceev = traceEv
 	mp.waittraceskip = traceskip
+	// 释放 M 的引用（允许其他 G 绑定此 M）
 	releasem(mp)
 	// can't do anything that might move the G between Ms here.
+	// 切换到调度栈执行 park_m 函数
 	mcall(park_m)
 }
 
@@ -3601,15 +3610,20 @@ func parkunlock_c(gp *g, lock unsafe.Pointer) bool {
 	return true
 }
 
+/*
+	park_m 是 Go 调度器中实现 goroutine 挂起和切换的核心函数，运行在调度栈（g0）上。
+*/
 // park continuation on g0.
 func park_m(gp *g) {
+	// 获取当前 g0（调度器专用 goroutine）
 	_g_ := getg()
 
 	if trace.enabled {
 		traceGoPark(_g_.m.waittraceev, _g_.m.waittraceskip)
 	}
-
+	// 操作：将目标 goroutine 状态从运行中（_Grunning）改为等待（_Gwaiting）
 	casgstatus(gp, _Grunning, _Gwaiting)
+	// 解绑 M 与 G
 	dropg()
 
 	if fn := _g_.m.waitunlockf; fn != nil {
@@ -3624,6 +3638,7 @@ func park_m(gp *g) {
 			execute(gp, true) // Schedule it back, never returns.
 		}
 	}
+	// 进入调度器主循环: 开始获取其他的g，并执行
 	schedule()
 }
 

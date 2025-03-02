@@ -139,6 +139,21 @@ func reflect_memclrNoHeapPointers(ptr unsafe.Pointer, n uintptr) {
 	memclrNoHeapPointers(ptr, n)
 }
 
+/*
+	这段代码是 Go 语言运行时中实现内存复制的核心函数 memmove 的声明，其核心目标是 安全复制内存，尤其是在涉及指针时确保垃圾回收器（GC）的正确性。
+
+    作用：将 n 字节从 from 指向的内存地址复制到 to 指向的内存地址。
+	与 C 的 memmove 的区别：
+		1. Go 的 memmove 在复制 可能包含指针的内存 时，会确保指针的写入是 原子操作（不可分割），避免其他协程或 GC 看到“部分写入”的指针。
+		2. 普通 memmove（如 C 语言）直接按字节复制，不保证指针写入的原子性。
+
+	关键设计背景
+	1. 垃圾回收器（GC）的安全性:
+		Go 的 GC 会扫描内存中的指针。如果复制指针时未原子写入，可能导致 GC 看到 无效的中间状态
+		（例如，指针的高 4 字节已更新，低 4 字节未更新），进而引发内存错误。
+	2. 并发安全问题:
+		若内存复制过程中指针被部分写入，其他协程的 竞态读取（racy read）可能读到损坏的指针，导致程序崩溃。
+*/
 // memmove copies n bytes from "from" to "to".
 //
 // memmove ensures that any pointer in "from" is written to "to" with
