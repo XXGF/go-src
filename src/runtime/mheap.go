@@ -63,17 +63,35 @@ const (
 // which must not be heap-allocated.
 
 //  是内存分配的核心结构体，Go 语言程序只会存在一个全局的结构，而堆上初始化的所有对象都由该结构体统一管理，
-// 该结构体中包含两组非常重要的字段，其中一个是全局的中心缓存列表 central，另一个是管理堆区内存区域的 arenas 以及相关字段。
-//
+//  该结构体中包含两组非常重要的字段，其中一个是全局的中心缓存列表 central，另一个是管理堆区内存区域的 arenas 以及相关字段。
+/*
+	mheap：代表Go程序持有的所有堆空间，Go程序使用一个mheap的全局对象_mheap来管理堆内存。
+	- 当mcentral没有空闲的mspan时，会向mheap申请。
+	- 当mheap没有资源时，会向操作系统申请新内存。
+	- mheap主要用于大对象的内存分配，以及管理未切割的mspan，用于给mcentral切割成小对象。
+	- mheap中含有所有规格的mcentral，所以，当一个mcache从mcentral申请mspan时，只需要在独立的mcentral中使用锁，并不会影响申请其他规格的mspan。
+
+	mheap 是 Go 运行时内存管理的核心结构，负责管理整个堆的虚拟地址空间，协调内存分配、回收和垃圾回收（GC）的关键操作。
+	核心职责：
+	- 内存分配：通过 allocSpan 分配连续页（> 32KB 对象直接由 mheap 管理）
+	- 中心缓存管理：维护 mcentral 数组，按 spanClass 分类管理不同大小的内存段
+	- 虚拟地址空间管理：使用 arenas 映射管理堆内存的元数据，支持动态扩展堆空间
+	- 内存回收与返还 OS：通过 scavengeGoal 和 reclaimIndex 控制内存返还策略
+	- GC 协调：与 sweepgen 和比例清扫机制联动，管理内存段的标记、清扫和复用
+
+*/
 //go:notinheap
 type mheap struct {
 	// lock must only be acquired on the system stack, otherwise a g
 	// could self-deadlock if its stack grows with the lock held.
-	lock      mutex
-	pages     pageAlloc // page allocation data structure
-	sweepgen  uint32    // sweep generation, see comment in mspan; written during STW
-	sweepdone uint32    // all spans are swept
-	sweepers  uint32    // number of active sweepone calls
+	// 全局锁，只能为系统栈持有
+	lock mutex
+	// 负责页分配的数据结构
+	pages pageAlloc // page allocation data structure
+
+	sweepgen  uint32 // sweep generation, see comment in mspan; written during STW
+	sweepdone uint32 // all spans are swept
+	sweepers  uint32 // number of active sweepone calls
 
 	// allspans is a slice of all mspans ever created. Each mspan
 	// appears exactly once.
@@ -86,6 +104,17 @@ type mheap struct {
 	// store. Accesses during STW might not hold the lock, but
 	// must ensure that allocation cannot happen around the
 	// access (since that may free the backing store).
+	/*
+		allspans 保存了堆中所有 mspan 的指针，每个 mspan 仅在此切片中出现一次。
+		用途包括：
+		1. 垃圾回收（GC）：GC 在标记存活对象时，需扫描所有 mspan。通过遍历 allspans，可以访问到所有内存段。
+		2. 调试与分析：通过 runtime.MemStats 或性能工具统计内存分布。
+		3. 内存释放：在程序退出或特定回收阶段，释放所有 mspan 占用的资源。
+
+		生命周期管理:
+		从 mspan 的创建（mheap.allocSpan）到释放（mheap.freeSpan），其指针始终存在于 allspans 中，即使 mspan 已被回收。
+
+	*/
 	allspans []*mspan // all spans out there   // 所有的spans从这里分配出去
 
 	// sweepSpans contains two mspan stacks: one of swept in-use
@@ -180,8 +209,26 @@ type mheap struct {
 	// platforms (even 64-bit), arenaL1Bits is 0, making this
 	// effectively a single-level map. In this case, arenas[0]
 	// will never be nil.
-	// 二维数组的一维大小会是 1，而二维大小是 4,194,304，因为每一个指针占用 8 字节的内存空间，所以元信息的总大小为 32MB。
-	// 由于每个 runtime.heapArena 都会管理 64MB 的内存，整个堆区最多可以管理 256TB 的内存，这比之前的 512GB 多好几个数量级。
+	// 64位系统：
+	//	二维数组的一维大小会是 1，而二维大小是 4MB，因为每一个指针占用 8 字节的内存空间，所以元信息的总大小为 4*8=32MB。
+	//  由于每个 runtime.heapArena 都会管理 64MB 的内存，整个堆区最多可以管理 4MB*64MB=256TB 的内存。
+	/*
+		arenas 字段是 Go 运行时管理堆内存的核心数据结构，通过多级映射机制高效管理虚拟地址空间的元数据。
+		虚拟地址空间元数据管理:
+		1. arenas 是一个二级指针数组，记录整个进程虚拟地址空间中每个 arena（内存块）的元数据（heapArena 对象）。
+			- arena 大小：64 位系统通常为 64MB，32 位系统为 4MB。
+			- 元数据内容：每个 heapArena 包含对应 arena 的页分配位图、跨度信息、GC 标记位图等。
+
+
+		// 64 位系统（单级映射，arenaL1Bits=0）：
+		arenas [1]*[4M]*heapArena // L1 数组长度为 1，L2 数组长度 4M
+
+		// 32 位系统（二级映射，arenaL1Bits=7）：
+		arenas [128]*[1024]*heapArena // L1 数组长度 128，L2 数组长度 1024
+
+		按需分配：初始时，L1 数组和 L2 数组均为 nil。当某个 arena 首次被分配时，运行时动态分配对应的 L2 数组。
+		内存高效：稀疏地址空间下，未使用的 arena 不占用 L2 数组内存。
+	*/
 	arenas [1 << arenaL1Bits]*[1 << arenaL2Bits]*heapArena // 这是一个二维数组，
 
 	// heapArenaAlloc is pre-reserved space for allocating heapArena
@@ -202,6 +249,16 @@ type mheap struct {
 	// append-only and old backing arrays are never freed, it is
 	// safe to acquire mheap_.lock, copy the slice header, and
 	// then release mheap_.lock.
+	// 所有已分配 arena 的索引列表，用于遍历堆内存
+	/*
+		数据结构定义：
+		- arenaIdx：标识单个 arena 的索引（如 64 位系统通常每个 arena 占 64MB）
+		- 切片特性：底层数组按需扩容，但旧数组永不释放（关键安全前提）
+
+		应用场景：
+		1. GC 扫描阶段：遍历所有 arena 定位存活对象
+		2. 堆内存统计：快速计算已分配 arena 总数
+	*/
 	allArenas []arenaIdx
 
 	// sweepArenas is a snapshot of allArenas taken at the
@@ -234,7 +291,9 @@ type mheap struct {
 	}
 
 	// 各种分配器
-	spanalloc             fixalloc // allocator for span*
+	// 1. 固定大小分配器，高效分配 mspan 对象
+	spanalloc fixalloc // allocator for span*
+	// 2. 分配 mcache 结构，每个 P 独占一个
 	cachealloc            fixalloc // allocator for mcache*
 	specialfinalizeralloc fixalloc // allocator for specialfinalizer*
 	specialprofilealloc   fixalloc // allocator for specialprofile*
@@ -246,6 +305,20 @@ type mheap struct {
 
 var mheap_ mheap
 
+/*
+	heapArena 是管理堆内存的核心结构，负责跟踪单个内存区域（arena）的元数据。
+
+	关键设计:
+	1.内存布局与寻址
+    - arena 划分：每个 heapArena 管理固定大小的内存区域（如 64MB），通过 spans 数组将连续虚拟页映射到 mspan。
+	- 页到 span 的映射
+		已分配 span：所有页直接指向该 span。
+		空闲 span：仅首尾页指向 span，内部页可能指向任意值（需通过其他机制验证）。
+
+	2. 位图高效管理
+		- 状态压缩存储：pageInUse、pageMarks、pageSpecials 使用位图（每 bit 表示一个 span 的状态），极大减少内存占用。
+		- 原子操作保障：位图的更新通过原子指令（如 atomic.Or8）实现线程安全，避免锁竞争。
+*/
 // A heapArena stores metadata for a heap arena. heapArenas are stored
 // outside of the Go heap and accessed via the mheap_.arenas index.
 //
@@ -254,6 +327,17 @@ type heapArena struct {
 	// bitmap stores the pointer/scalar bitmap for the words in
 	// this arena. See mbitmap.go for a description. Use the
 	// heapBits type to access this.
+	/*
+		每个 字（word） 对应位图中的 2 位，用于描述该字的内存属性：
+		- 第 1 位：标记该字是否包含指针（pointer bit）。
+		- 第 2 位：标记该字是否已被 GC 扫描（scan bit），避免重复扫描。
+
+		假设一个 heapArena 管理 64MB 内存（heapArenaBytes = 64 << 20），字大小为 8 字节（64 位系统）：
+		1. 总字数 = 64MB / 8B = 8,388,608 字
+		2. 总位数 = 8,388,608 字 * 2 位/字 = 16,777,216 位
+		3. 位图字节数 = 16,777,216 位 / 8 位/字节 = 2,097,152 字节 = 2MB
+		因此，bitmap 被定义为 [2 << 20]byte（即 heapArenaBitmapBytes = 2MB）。
+	*/
 	bitmap [heapArenaBitmapBytes]byte
 
 	// spans maps from virtual address page ID within this arena to *mspan.
@@ -267,6 +351,19 @@ type heapArena struct {
 	// known to contain in-use or stack spans. This means there
 	// must not be a safe-point between establishing that an
 	// address is live and looking it up in the spans array.
+	/*
+		用于将虚拟内存页（Page）映射到对应的内存段（mspan）。
+			数组长度：pagesPerArena = heapArenaBytes / pageSize
+				- 若 heapArenaBytes = 64MB（32 位系统）且 pageSize = 8KB，则 pagesPerArena = 8192。
+				- 每个元素对应 heapArena 中的一个内存页（Page）。
+			元素类型：*mspan 指针，指向管理该页的 mspan 对象。
+
+		核心作用：
+		1. 给定一个对象的虚拟地址 addr，可通过以下步骤找到其所属的 mspan：
+			1. pageID := (addr - arenaBase) / pageSize
+			2. 通过 spans[pageIdx] 获取该页对应的 mspan
+		2. 快速定位对象所属 span：在垃圾回收（GC）和内存分配时，快速确定对象所在的 mspan，进而访问其元数据（如对象大小、是否包含指针等）。
+	*/
 	spans [pagesPerArena]*mspan
 
 	// pageInUse is a bitmap that indicates which spans are in

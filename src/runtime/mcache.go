@@ -9,6 +9,13 @@ import (
 	"unsafe"
 )
 
+/*
+	每个工作线程都会绑定一个mcache，本地缓存可用的mspan资源。
+	这样就可以直接给Goroutine分配，因为不存在多个Goroutine竞争的情况，所以不会消耗锁资源。
+
+	mcache在初始化的时候是没有任何mspan资源的，在使用过程中会动态地从mcentral申请，之后会缓存下来。
+	当对象小于等于32KB大小时，使用mcache的相应规格的mspan进行分配。
+*/
 // Per-thread (in Go, per-P) cache for small objects.
 // No locking needed because it is per-thread (per-P).
 //
@@ -27,7 +34,7 @@ type mcache struct {
 	// so they are grouped here for better caching.
 	next_sample uintptr // trigger heap sample after allocating this many bytes
 	// 分配的可扫描的字节数
-	local_scan  uintptr // bytes of scannable heap allocated
+	local_scan uintptr // bytes of scannable heap allocated
 
 	// Allocator cache for tiny objects w/o pointers.
 	// See "Tiny allocator" comment in malloc.go.
@@ -41,20 +48,24 @@ type mcache struct {
 
 	// tiny 指向当前 tiny 块的起始位置，或当没有 tiny 块时候为 nil
 	// tiny 是一个堆指针。由于mcache在非GC内存中，我们通弄过在 mark termination 期间，在releaseAll 中清楚它来处理它
-	tiny             uintptr
+	tiny uintptr
 	// 下一个空闲内存所在的偏移量
-	tinyoffset       uintptr
+	tinyoffset uintptr
 	// 记录内存分配器中分配的对象个数。
-	local_tinyallocs uintptr     // number of tiny allocs not counted in other stats
+	local_tinyallocs uintptr // number of tiny allocs not counted in other stats
 
 	// 以上字段会在每次alloc时，都被访问
 
 	// The rest is not accessed on every malloc.
 
+	/*
+		numSpanClasses = _NumSizeClasses << 1 = _NumSizeClasses * 2
+		why: 为了加速之后内存回收的速度，数组里一半的mspan中分配的对象不包含指针，另一半则包含指针。
+	*/
 	// 每一个线程缓存都持有 67 * 2 个 runtime.mspan，这些内存管理单元都存储在结构体的 alloc 字段中：
 	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass  // 用来分配的 spans，由 spanClass 索引
 
-	stackcache [_NumStackOrders]stackfreelist    // 栈内存由于与线程关系比较密切，所以我们在每一个线程缓存 runtime.mcache 中都加入了栈缓存减少锁竞争影响。
+	stackcache [_NumStackOrders]stackfreelist // 栈内存由于与线程关系比较密切，所以我们在每一个线程缓存 runtime.mcache 中都加入了栈缓存减少锁竞争影响。
 
 	// Local allocator stats, flushed during GC.
 	// 本地分配器统计，在 GC 期间被刷新

@@ -14,6 +14,27 @@ package runtime
 
 import "runtime/internal/atomic"
 
+/*
+	0. 每个central结构体都在mheap中维护。
+	1. mcentral 为所有mcache提供切分好的mspan资源。
+	2. 每个mcentral保存一种特定大小的全局mspan列表，包括已分配出去的和未分配出去的。
+	3. 每个mcentral对应一种mspan，而mspan的种类导致它分割的object大小不同。
+	4. 当工作线程的mcache中没有合适（也就是特定大小的）的mspan时就会从mcentral获取。
+
+	mcache从mcentral获取和归还mspan的流程：
+	1. 获取:
+		加锁；
+		从nonempty链表找到一个可用的mspan；
+		并将其从nonempty链表删除；
+		将取出的mspan加入到empty链表；
+		将mspan返回给工作线程；
+		解锁。
+	2. 归还:
+		加锁；
+		将mspan从empty链表删除；
+		将mspan加入到nonempty链表；
+		解锁。
+*/
 // Central list of free objects of a given size.
 //
 // 是内存分配器的中心缓存，与线程缓存不同，访问中心缓存中的内存管理单元需要使用互斥锁：
@@ -21,7 +42,7 @@ import "runtime/internal/atomic"
 //go:notinheap
 type mcentral struct {
 	// 互斥锁
-	lock      mutex
+	lock mutex
 	// 规格
 	spanclass spanClass
 
@@ -30,7 +51,7 @@ type mcentral struct {
 	// 尚有空闲object的mspan链表
 	nonempty mSpanList // list of spans with a free object, ie a nonempty free list       // 实际上是 有空闲对象的 span 链表
 	// 没有空闲object的mspan链表，或者是已被mcache取走的msapn链表
-	empty    mSpanList // list of spans with no free objects (or cached in an mcache)     // 实际上是 没有空闲对象或 span 已经被 mcache 缓存的 span 链表。
+	empty mSpanList // list of spans with no free objects (or cached in an mcache)     // 实际上是 没有空闲对象或 span 已经被 mcache 缓存的 span 链表。
 
 	// partial and full contain two mspan sets: one of swept in-use
 	// spans, and one of unswept in-use spans. These two trade
@@ -57,7 +78,7 @@ type mcentral struct {
 	// this mcentral, assuming all spans in mcaches are
 	// fully-allocated. Written atomically, read under STW.
 	// 已累计分配的对象个数
-	nmalloc uint64                                // 已分配对象的累计计数器
+	nmalloc uint64 // 已分配对象的累计计数器
 }
 
 // Initialize a single central free list.
