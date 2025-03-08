@@ -398,6 +398,13 @@ func makemap_small() *hmap {
 // can be created on the stack, h and/or bucket may be non-nil.
 // If h != nil, the map can be created directly in h.
 // If h.buckets != nil, bucket pointed to can be used as the first bucket.
+/*
+	参数：
+	t *maptype：包含 map 类型元信息的结构体
+	hint int：创建 map 时指定的容量提示
+	h *hmap：可选参数，可能预分配的 map 头结构
+	返回 *hmap：最终创建的 map 头指针
+*/
 func makemap(t *maptype, hint int, h *hmap) *hmap {
 	mem, overflow := math.MulUintptr(uintptr(hint), t.bucket.size)
 	if overflow || mem > maxAlloc {
@@ -417,6 +424,7 @@ func makemap(t *maptype, hint int, h *hmap) *hmap {
 	B := uint8(0)
 	// 2. 根据传入的 hint 计算出需要的最小需要的桶的数量
 	for overLoadFactor(hint, B) {
+		// 桶的数量需要扩张，是以原来的2被数量进行增长
 		B++
 	}
 	h.B = B
