@@ -189,7 +189,6 @@ type mheap struct {
 	// this space to avoid interleaving it with the heap itself.
 	heapArenaAlloc linearAlloc
 
-
 	arenaHints *arenaHint
 
 	// arena is a pre-reserved space for all ocating heap arenas
@@ -230,7 +229,7 @@ type mheap struct {
 	// gets its own cache line.
 	// central is indexed by spanClass.
 	central [numSpanClasses]struct {
-		mcentral mcentral   // 页堆中包含一个长度为 134 的 runtime.mcentral 数组，其中 67 个为跨度类需要 scan 的中心缓存，另外的 67 个是 noscan 的中心缓存
+		mcentral mcentral // 页堆中包含一个长度为 134 的 runtime.mcentral 数组，其中 67 个为跨度类需要 scan 的中心缓存，另外的 67 个是 noscan 的中心缓存
 		pad      [cpu.CacheLinePadSize - unsafe.Sizeof(mcentral{})%cpu.CacheLinePadSize]byte
 	}
 
@@ -321,9 +320,9 @@ type heapArena struct {
 //
 //go:notinheap
 type arenaHint struct {
-	addr uintptr       // arena的起始地址
-	down bool          // 是否为最后一个arena
-	next *arenaHint    // 指向下一个arena的指针
+	addr uintptr    // arena的起始地址
+	down bool       // 是否为最后一个arena
+	next *arenaHint // 指向下一个arena的指针
 }
 
 // An mspan is a run of pages.
@@ -401,17 +400,51 @@ type mSpanList struct {
 	last  *mspan // last span in list, or nil if none
 }
 
+/*
+	mspan 是 Go 运行时中管理内存段（memory span）的基础单元，每个 mspan 负责管理一块连续的内存页[每页大小8KB]，用于分配特定大小的对象。
+	- 每个mspan能存的对象大小从这里取：class_to_size
+	- 每个mspan能分配到的页数从这里取：class_to_allocnpages
+	- sizeClass就是索引，是在创建mspan时指定的
+
+	核心机制：
+	1. 空闲对象查找：通过 freeindex 和 allocCache 快速定位下一个空闲对象。
+	2. 垃圾回收
+        - 标记阶段：将存活对象标记到 gcmarkBits 位图。
+		- 清扫阶段：比较 sweepgen 与全局代次，决定是否需要清扫：
+		- 清扫完成后，allocBits 会被替换为 gcmarkBits，并重置 gcmarkBits。
+
+	一、mspan的创建过程
+	首先，mspan 是堆内存的管理单元。
+	其次，每一个线程缓存都持有 67 * 2 个 mspan，这些内存管理单元都存储在结构体的 alloc 字段中：alloc [numSpanClasses]*mspan
+	所以，mspan 是在 mcache 中被创建的，mcache 是每个 P 的本地缓存。
+
+	二、mspan的分配过程
+	mspan是在 程序通过 new 或 make 请求堆内存时，被分配的。整个分配过程如下：
+	1. 通过 mcache（每个 P 的本地缓存）中的 alloc [numSpanClasses]*mspan 获取对应 spanClass 的 mspan。
+	2. 若 mcache 中对应的 mspan 已满或无可用 mspan，会从 mcentral（全局中心缓存）获取。
+	3. 若 mcentral 也无可用 mspan，最终会从 mheap（全局堆）分配新的 mspan。
+
+	三、假设一个mspan的Size Class等于10，即它存储的object大小是144B，那么mspan的各个字段值如下：
+	- npages = 1      【从class_to_size获取】【一页=8KB】
+	- elemSize = 144B 【从class_to_size获取】
+	- nelems = 8KB/144B = 56.89 约等于 26
+	- spanClass = 10 * 2 = 20
+*/
 //go:notinheap
 type mspan struct {
-	next *mspan     // next span in list, or nil if none                     // 链表中的下一个 span，如果为空则为 nil
-	prev *mspan     // previous span in list, or nil if none                 // 链表中的前一个 span，如果为空则为 nil
+	// 	链表指针
+	next *mspan // next span in list, or nil if none                     // 链表中的下一个 span，如果为空则为 nil
+	prev *mspan // previous span in list, or nil if none                 // 链表中的前一个 span，如果为空则为 nil
+	// 调试用链表（未来可能移除）
 	list *mSpanList // For debugging. TODO: Remove.
 
 	// 起始地址，也即所管理页的起始地址
 	startAddr uintptr // address of first byte of span aka s.base()          // span 的第一个字节的地址，即 s.base()，即它管理的内存页的起始地址
 	// 管理的页数
-	npages    uintptr // number of pages in span                             // 一个 span 中的 page 数量
+	npages uintptr // number of pages in span                             // 一个 span 中的 page 数量
 
+	/* 1. 空闲对象管理 */
+	// 1.1 手动管理内存段的空闲对象链表
 	manualFreeList gclinkptr // list of free objects in mSpanManual spans    // mSpanManual span 的释放对象链表
 
 	// freeindex is the slot index between 0 and nelems at which to begin scanning
@@ -429,20 +462,22 @@ type mspan struct {
 	// undefined and should never be referenced.
 	//
 	// Object n starts at address n*elemsize + (start << pageShift).
-	freeindex uintptr                                                    //  扫描页中空闲对象的初始索引
+	// 1.2 下一个空闲对象的索引
+	freeindex uintptr //  扫描页中空闲对象的初始索引
 	// TODO: Look up nelems from sizeclass and remove this field if it
 	// helps performance.
-	// 块个数，表示有多少个块可供分配
+	// 1.3 总对象个数
 	nelems uintptr // number of object in the span.                     // span中的object的数量
-
 	// Cache of the allocBits at freeindex. allocCache is shifted
 	// such that the lowest bit corresponds to the bit freeindex.
 	// allocCache holds the complement of allocBits, thus allowing
 	// ctz (count trailing zero) to use it directly.
 	// allocCache may contain bits beyond s.nelems; the caller must ignore
 	// these.
-	allocCache uint64  // allocBits 的补码，可以用于快速查找内存中未被使用的内存
+	// 1.4 位图缓存（加速空闲对象查找）
+	allocCache uint64 // allocBits 的补码，可以用于快速查找内存中未被使用的内存
 
+	/* 2. 内存标记位图 */
 	// allocBits and gcmarkBits hold pointers to a span's mark and
 	// allocation bits. The pointers are 8 byte aligned.
 	// There are three arenas where this data is held.
@@ -465,9 +500,10 @@ type mspan struct {
 	// The sweep will free the old allocBits and set allocBits to the
 	// gcmarkBits. The gcmarkBits are replaced with a fresh zeroed
 	// out memory.
-	// 分配位图，每一位代表一个块是否已经分配
-	allocBits  *gcBits             // 用于标记内存的占用情况
-	gcmarkBits *gcBits             // 用户标记内存的回收情况
+	// 2.1 分配位图（标记对象是否已分配）
+	allocBits *gcBits // 用于标记内存的占用情况
+	// 2.2 GC 标记位图（标记对象存活状态）
+	gcmarkBits *gcBits // 用户标记内存的回收情况
 
 	// sweep generation:
 	// if sweepgen == h->sweepgen - 2, the span needs sweeping
@@ -477,22 +513,31 @@ type mspan struct {
 	// if sweepgen == h->sweepgen + 3, the span was swept and then cached and is still cached
 	// h->sweepgen is incremented by 2 after every GC
 
-	sweepgen    uint32
-	divMul      uint16        // for divide by elemsize - divMagic.mul
-	baseMask    uint16        // if non-0, elemsize is a power of 2, & this will get object allocation base
-	// 已分配块的个数
-	allocCount  uint16        // number of allocated objects                           // 分配的对象数量
-	// class表中的class ID，和Size Classs相关
-	spanclass   spanClass     // size class and noscan (uint8)                         // 对象大小等级和是否需要被gc扫描
-	state       mSpanStateBox // mSpanInUse etc; accessed atomically (get/set methods)
-	needzero    uint8         // needs to be zeroed before allocation
-	divShift    uint8         // for divide by elemsize - divMagic.shift
-	divShift2   uint8         // for divide by elemsize - divMagic.shift2
-	// class表中的对象大小，也即块大小
-	elemsize    uintptr       // computed from sizeclass or from npages
-	limit       uintptr       // end of data in span
-	speciallock mutex         // guards specials list
-	specials    *special      // linked list of special records sorted by offset.
+	/* 3. GC相关 */
+	// 3.1 清扫代次（与 GC 周期同步）
+	sweepgen uint32
+	// 3.2 预计算值（用于加速对象地址计算）
+	divMul   uint16 // for divide by elemsize - divMagic.mul
+	baseMask uint16 // if non-0, elemsize is a power of 2, & this will get object allocation base
+	// 3.3 已分配对象数量
+	allocCount uint16 // number of allocated objects
+	// 3.4 class表中的class ID，和Size Classs相关: 对象大小等级和是否需要被gc扫描
+	spanclass spanClass // size class and noscan (uint8)
+	// 3.5 内存段状态（如 mSpanInUse）
+	state mSpanStateBox // mSpanInUse etc; accessed atomically (get/set methods)
+	// 3.6 是否需要清零内存
+	needzero  uint8 // needs to be zeroed before allocation
+	divShift  uint8 // for divide by elemsize - divMagic.shift
+	divShift2 uint8 // for divide by elemsize - divMagic.shift2
+	// 3.7 单个对象的大小
+	elemsize uintptr // computed from sizeclass or from npages
+	// 3.8 内存段结束地址
+	limit uintptr // end of data in span
+
+	// 保护特殊记录的锁
+	speciallock mutex // guards specials list
+	// 特殊记录链表（如 finalizer）
+	specials *special // linked list of special records sorted by offset.
 }
 
 func (s *mspan) base() uintptr {
@@ -747,7 +792,6 @@ func (h *mheap) init() {
 	// 不对 mspan 的分配清零，后台扫描可以通过分配它来并发的检查一个 span
 	// 因此 span 的 sweepgen 在释放和重新分配时候能存活，从而可以防止后台扫描
 	// 不正确的将其从 0 进行 CAS。
-
 
 	// This is safe because mspan contains no heap pointers.
 	// 因为 mspan 不包含堆指针，因此它是安全的
