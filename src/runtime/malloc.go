@@ -955,13 +955,13 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			// Hence, we use stricter alignment that matches
 			// the normal allocator better.
 			// 内存对齐相关
-			if size&7 == 0 {   // >= 8
+			if size&7 == 0 { // >= 8
 				align = 8
-			} else if size&3 == 0 {  // == 4
+			} else if size&3 == 0 { // == 4
 				align = 4
 			} else if size&1 == 0 { // == 2
 				align = 2
-			} else {                // == 1
+			} else { // == 1
 				align = 1
 			}
 		}
@@ -999,7 +999,6 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	// Set mp.mallocing to keep from being preempted by GC.
 	// 设置 mp.mallocing 以防止被GC抢占
-	// mp是什么？？？
 	mp := acquirem()
 	if mp.mallocing != 0 {
 		throw("malloc deadlock")
@@ -1007,7 +1006,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	if mp.gsignal == getg() {
 		throw("malloc during signal")
 	}
-	mp.mallocing = 1  // 设置 mp.mallocing为1， 以防止被GC抢占
+	mp.mallocing = 1 // 设置 mp.mallocing为1， 以防止被GC抢占
 
 	shouldhelpgc := false
 	dataSize := size
@@ -1030,9 +1029,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// 这里才是真正进行内存分配的源码
 	var span *mspan
 	var x unsafe.Pointer
-	noscan := typ == nil || typ.ptrdata == 0    // noscan 表示是非指针类型
+	noscan := typ == nil || typ.ptrdata == 0 // noscan 表示是非指针类型
 	if size <= maxSmallSize {
-		// 类型的大小，小于等于小对象的最大内存：32KB
+		// 一、对象类型的大小，<= 小对象的最大内存32KB。包好微对象【对象类型大小<16B】和小对象【对象类型大小>=16B && <=32KB】
 		if noscan && size < maxTinySize {
 			// 1.微对象分配
 			// Go 语言运行时将小于 16 字节的对象划分为微对象，它会使用“线程缓存“上的“微分配器“提高微对象分配的性能。
@@ -1071,25 +1070,26 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			// reduces heap size by ~20%.
 			off := c.tinyoffset
 			// Align tiny pointer for required (conservative) alignment.
-			if size&7 == 0 {                  // 8的n次幂，例如：8、16、32
-				off = alignUp(off, 8)      // 8字节对齐
-			} else if size&3 == 0 {           // 4的n次幂，例如：4、12 这里有个bug: 如果一个struct是12字节，且第一个字段是8字节，也不能保证8字节对齐。
-				off = alignUp(off, 4)      // 4字节对齐
-			} else if size&1 == 0 {           // 2的n次幂，例如：2、6
-				off = alignUp(off, 2)      // 2字节对齐
+			if size&7 == 0 { // 8的n次幂，例如：8、16、32
+				off = alignUp(off, 8) // 8字节对齐
+			} else if size&3 == 0 { // 4的n次幂，例如：4、12 这里有个bug: 如果一个struct是12字节，且第一个字段是8字节，也不能保证8字节对齐。
+				off = alignUp(off, 4) // 4字节对齐
+			} else if size&1 == 0 { // 2的n次幂，例如：2、6
+				off = alignUp(off, 2) // 2字节对齐
 			}
 			if off+size <= maxTinySize && c.tiny != 0 {
 				// The object fits into existing tiny block.
 				// 如果当前块中还包含大小合适的空闲内存，会通过基地址【c.tiny】和偏移量【c.tinyoffset】，获取并返回这块内存
-				x = unsafe.Pointer(c.tiny + off)  // 取得存储微对象的内存块的地址
-				c.tinyoffset = off + size         // 下一个空闲内存块的起始便宜地址
-				c.local_tinyallocs++              // 已存储的微对象数量+1
-				mp.mallocing = 0                  // 更改mallocing对象的状态
+				x = unsafe.Pointer(c.tiny + off) // 取得存储微对象的内存块的地址
+				c.tinyoffset = off + size        // 下一个空闲内存块的起始便宜地址
+				c.local_tinyallocs++             // 已存储的微对象数量+1
+				mp.mallocing = 0                 // 更改mallocing对象的状态
 				releasem(mp)
 				return x
 			}
 
 			// Allocate a new maxTinySize block.
+			//  分配一个新的微对象内存块。
 			// 1.先线程缓存找到跨度类对应的内存管理单元 runtime.mspan
 			span = c.alloc[tinySpanClass]
 			// 2.调用 runtime.nextFreeFast 获取空闲的内存
@@ -1293,7 +1293,7 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 // 内存分配的核心入口
 // _type: 为go类型的实现，通过其size属性能够获得该类型所需要的大小
 func newobject(typ *_type) unsafe.Pointer {
-	return mallocgc(typ.size, typ, true)  // true: 内存清零
+	return mallocgc(typ.size, typ, true) // true: 内存清零
 }
 
 //go:linkname reflect_unsafe_New reflect.unsafe_New

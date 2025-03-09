@@ -208,6 +208,7 @@ func (c *mcentral) cacheSpan() *mspan {
 	}
 
 	// We failed to get a span from the mcentral so get one from mheap.
+	// 从mcentral中获取不到span，则去mheap中申请新的span
 	s = c.grow()
 	if s == nil {
 		return nil

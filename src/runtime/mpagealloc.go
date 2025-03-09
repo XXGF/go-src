@@ -752,6 +752,11 @@ nextLevel:
 // should be ignored.
 //
 // s.mheapLock must be held.
+/*
+	pageAlloc.alloc 是 Go 运行时中用于从全局堆（mheap）直接分配连续内存页的核心函数，通常用于大对象分配或补充线程本地缓存（如 pageCache）。
+	核心功能：
+	从全局堆分配 npages 个连续的 物理内存页，返回分配区域的基地址和该区域内已释放给操作系统的物理内存字节数。
+*/
 func (s *pageAlloc) alloc(npages uintptr) (addr uintptr, scav uintptr) {
 	// If the searchAddr refers to a region which has a higher address than
 	// any known chunk, then we know we're out of memory.

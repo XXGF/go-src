@@ -15,10 +15,22 @@ const pageCachePages = 8 * unsafe.Sizeof(pageCache{}.cache)
 // allocate from without a lock. More specifically, it represents
 // a pageCachePages*pageSize chunk of memory with 0 or more free
 // pages in it.
+/*
+	pageCache 是 Go 运行时内存分配器的核心组件之一，用于实现无锁的高效内存页分配。
+	设计目标：
+	1. 无锁分配：每个 P（逻辑处理器）拥有独立的 pageCache，分配时无需全局锁。
+	2. 快速分配路径：通过位图（cache）实现 O(1) 时间复杂度的页分配。
+	3. 物理内存回收：通过 scav 位图跟踪可释放的物理内存页，支持按需返还给操作系统。
+	4. 缓存填充：从全局堆补充：当 pageCache 为空时，从全局 mheap 申请新的内存块。
+	5. 操作系统交互：通过 madvise(MADV_FREE) 通知内核可回收物理内存，但保留虚拟地址空间。
+*/
 type pageCache struct {
-	base  uintptr // base address of the chunk
-	cache uint64  // 64-bit bitmap representing free pages (1 means free)
-	scav  uint64  // 64-bit bitmap representing scavenged pages (1 means scavenged)
+	// 内存块的基地址，指向连续内存区域的起始位置
+	base uintptr // base address of the chunk
+	// 位图管理 64 页（默认配置）的空闲状态，1 表示对应页可用
+	cache uint64 // 64-bit bitmap representing free pages (1 means free)
+	// 位图记录已释放物理内存的页（通过 madvise 通知操作系统回收物理内存）
+	scav uint64 // 64-bit bitmap representing scavenged pages (1 means scavenged)
 }
 
 // empty returns true if the pageCache has any free pages, and false
@@ -103,6 +115,10 @@ func (c *pageCache) flush(s *pageAlloc) {
 // chunk.
 //
 // s.mheapLock must be held.
+/*
+	功能：从全局页分配器 (pageAlloc) 中分配一个 64 页对齐的内存块（可能不连续），返回 pageCache 结构。
+	调用条件：需持有 mheapLock，确保线程安全。
+*/
 func (s *pageAlloc) allocToCache() pageCache {
 	// If the searchAddr refers to a region which has a higher address than
 	// any known chunk, then we know we're out of memory.

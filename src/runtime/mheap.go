@@ -1277,6 +1277,14 @@ func (h *mheap) freeMSpanLocked(s *mspan) {
 // 1.从堆上分配新的内存页和内存管理单元 mspan
 // 2.初始化内存管理单元，并将其加入 mheap 持有的内存单元列表
 //
+/*
+	功能：从堆中分配一个包含 npages 页的 mspan。
+	参数：
+	npages：请求的页数。
+	typ：分配类型（堆、栈、手动管理等）。
+	spanclass：内存段类别（小对象分类或大对象标记）。
+	返回值：初始化好的 mspan 结构。
+*/
 //go:systemstack
 func (h *mheap) allocSpan(npages uintptr, manual bool, spanclass spanClass, sysStat *uint64) (s *mspan) {
 	// Function-global state.
@@ -1284,21 +1292,44 @@ func (h *mheap) allocSpan(npages uintptr, manual bool, spanclass spanClass, sysS
 	base, scav := uintptr(0), uintptr(0)
 
 	// If the allocation is small enough, try the page cache!
+	/*
+		条件：无需物理页对齐 + P 存在 + 请求页数小于页缓存容量的 1/4（默认页缓存 64 页，故 16 页以下走此路径【小对象的span不足时都是走此路径】）。
+		操作流程：
+		1. 检查本地页缓存：若缓存为空，加堆锁并调用 allocToCache 从全局堆填充缓存。
+		2. 从缓存分配：调用 c.alloc(npages) 尝试分配，返回基地址 base 和释放的页数 scav。
+		3. 获取 mspan：若分配成功，尝试从空闲 mspan 池获取一个结构体（tryAllocMSpan）。
+		4. 成功路径：若 mspan 获取成功，跳转到 HaveSpan 初始化内存段。
+		5. 失败处理：若 mspan 获取失败，继续后续逻辑（需加堆锁处理）。
+
+		页缓存（Page Cache）
+		结构：每个 P（Processor）拥有一个本地页缓存 (pcache)，缓存 64 个页（默认）。
+		作用：减少全局堆锁竞争，提升小内存分配速度。
+		填充条件：当缓存为空时，从全局堆的 pageAlloc 分配器批量获取对齐的内存块。
+		分配策略：仅用于分配小于 16 页（pageCachePages/4）的请求，避免碎片化。
+	*/
 	pp := gp.m.p.ptr()
 	if pp != nil && npages < pageCachePages/4 {
 		// 1.如果申请的内存比较小，获取申请内存的处理器并尝试调用 runtime.pageCache.alloc 获取内存区域的基地址和大小；
 		c := &pp.pcache
 
 		// If the cache is empty, refill it.
+		//
 		if c.empty() {
 			lock(&h.lock)
+			/*
+				pageAlloc.allocToCache 是 Go 运行时中用于为线程本地缓存（pageCache）批量填充内存页的核心函数。
+				核心功能：
+				从全局堆（mheap）获取一个按 pageCachePages 对齐的内存块（默认对齐 64 页），并将其封装为 pageCache 结构，供线程本地缓存使用。
+			*/
 			*c = h.pages.allocToCache()
 			unlock(&h.lock)
 		}
 
 		// Try to allocate from the cache.
+		// 1.如果要获取的内存较小，尝试从P的pageCache中获取
 		base, scav = c.alloc(npages)
 		if base != 0 {
+			// 1.1 如果从 P 的pageCache中获取到内存，则从P的mspancache中获取span
 			s = h.tryAllocMSpan()
 
 			if s != nil && gcBlackenEnabled == 0 && (manual || spanclass.sizeclass() != 0) {
@@ -1324,9 +1355,9 @@ func (h *mheap) allocSpan(npages uintptr, manual bool, spanclass spanClass, sysS
 	// whole job done without the heap lock.
 	lock(&h.lock)
 
+	// 2.如果申请的内存比较大或者线程的页缓存中内存不足，会通过 runtime.pageAlloc.alloc 在页堆上申请内存；
 	if base == 0 {
 		// Try to acquire a base address.
-		// 2.如果申请的内存比较大或者线程的页缓存中内存不足，会通过 runtime.pageAlloc.alloc 在页堆上申请内存；
 		base, scav = h.pages.alloc(npages)
 		if base == 0 {
 			// 3.如果发现页堆上的内存不足，会尝试通过 runtime.mheap.grow 进行扩容，并重新调用 runtime.pageAlloc.alloc 申请内存；
@@ -1417,6 +1448,7 @@ HaveSpan:
 			s.divShift2 = 0
 			s.baseMask = 0
 		} else {
+			// 将span切割成要求的大小
 			s.elemsize = uintptr(class_to_size[sizeclass])
 			s.nelems = nbytes / s.elemsize
 

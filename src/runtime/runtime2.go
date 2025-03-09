@@ -641,7 +641,17 @@ type p struct {
 	m           muintptr   // back-link to associated m (nil if idle)
 	// 当调用 runtime.procresize 时，初始化新的 P 时，mcache 是直接分配到 p 的； 回收 p 时，mcache 是直接从 p 上获取
 	// 所以可以得出结论：mcache是跟着P跑的
-	mcache      *mcache // 每个P都有一个mcache
+	mcache *mcache // 每个P都有一个mcache
+
+	/*
+		pageCache 是 Go 运行时内存分配器的核心组件之一，用于实现无锁的高效内存页分配。
+		设计目标：
+		1. 无锁分配：每个 P（逻辑处理器）拥有独立的 pageCache，分配时无需全局锁。
+		2. 快速分配路径：通过位图（cache）实现 O(1) 时间复杂度的页分配。
+		3. 物理内存回收：通过 scav 位图跟踪可释放的物理内存页，支持按需返还给操作系统。
+		4. 缓存填充：从全局堆补充：当 pageCache 为空时，从全局 mheap 申请新的内存块。
+		5. 操作系统交互：通过 madvise(MADV_FREE) 通知内核可回收物理内存，但保留虚拟地址空间。
+	*/
 	pcache      pageCache
 	raceprocctx uintptr
 
@@ -687,6 +697,7 @@ type p struct {
 	sudogbuf   [128]*sudog
 
 	// Cache of mspan objects from the heap.
+	// 缓存从堆中获取的 mspan 对象
 	mspancache struct {
 		// We need an explicit length here because this field is used
 		// in allocation codepaths where write barriers are not allowed,
